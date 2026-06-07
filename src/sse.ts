@@ -11,7 +11,7 @@ import { registerHttpDiagnosticsRoutes } from "./httpDiagnostics.js";
 import { createHttpAuthState, registerHttpAuthRoutes } from "./httpAuth.js";
 
 export async function startHttpMcpServer(
-  createMcpServer: () => Promise<McpServer>,
+  createMcpServer: (req?: Request) => Promise<McpServer>,
   port: number,
   config: ServerConfig,
 ) {
@@ -170,7 +170,7 @@ export async function startHttpMcpServer(
           }
         };
 
-        const server = await createMcpServer();
+        const server = await createMcpServer(req);
         await server.connect(transport);
       } else {
         res.status(400).json({
@@ -223,7 +223,7 @@ export async function startHttpMcpServer(
         delete transports[sessionId];
       });
 
-      const server = await createMcpServer();
+      const server = await createMcpServer(req);
       await server.connect(transport);
       console.error(
         `[affine-mcp] Legacy SSE session established: ${sessionId}`,

@@ -20,6 +20,8 @@ import { startHttpMcpServer } from "./sse.js";
 import { existsSync } from "fs";
 import { CONFIG_FILE } from "./config.js";
 import { createToolFilter, toolFilterRequiresRegisterTool } from "./toolSurface.js";
+import { exchangeUserSession, invalidateUserSession, TokenExchangeError } from "./tokenExchange.js";
+import type { Request } from "express";
 
 // CLI commands: affine-mcp login|status|logout|version
 const rawArgs = process.argv.slice(2);
@@ -73,8 +75,43 @@ if (config.authMode === "oauth" && !useHttpTransport) {
   throw new Error("AFFINE_MCP_AUTH_MODE=oauth requires MCP_TRANSPORT=http (or streamable/sse).");
 }
 
-async function buildServer() {
-  const server = new McpServer({ name: "affine-mcp", version: VERSION });
+/** True when the per-user token-exchange path is configured (both URL + secret). */
+function isTokenExchangeEnabled(): boolean {
+  return !!(config.tokenExchange.url && config.tokenExchange.proxySecret);
+}
+
+/**
+ * Read the chat user's Zitadel access token from the configured inbound header.
+ * Express lower-cases header names; the configured header name is normalised to
+ * lower-case at load time to match.
+ */
+function readUserAccessToken(req: Request | undefined): string | undefined {
+  if (!req) return undefined;
+  const raw = req.headers[config.tokenExchange.userTokenHeader];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  // Tolerate a `Bearer ` prefix in case the gateway forwards it that way.
+  const bearer = /^Bearer\s+(.+)$/i.exec(trimmed);
+  const token = bearer ? bearer[1] : trimmed;
+  return token || undefined;
+}
+
+/**
+ * The shared service-credential GraphQL client. Built once on first use and
+ * reused for every session that does NOT carry a per-user token — byte-identical
+ * to the prior singleton behaviour (including the async email/password login
+ * that mutates this instance after construction).
+ */
+let serviceGqlClientPromise: Promise<GraphQLClient> | undefined;
+
+function buildServiceGraphQLClient(): Promise<GraphQLClient> {
+  if (serviceGqlClientPromise) return serviceGqlClientPromise;
+  serviceGqlClientPromise = buildServiceGraphQLClientImpl();
+  return serviceGqlClientPromise;
+}
+
+async function buildServiceGraphQLClientImpl(): Promise<GraphQLClient> {
+
   const gqlHeaders = { ...(config.headers || {}) };
   const gqlBearer = config.apiToken;
 
@@ -151,6 +188,61 @@ async function buildServer() {
   if (!gql.isAuthenticated()) {
     console.error("WARNING: No authentication configured. Some operations may fail.");
     console.error("Set AFFINE_API_TOKEN or run: affine-mcp login");
+  }
+
+  return gql;
+}
+
+/**
+ * Build a per-user GraphQL client by exchanging the chat user's Zitadel access
+ * token for that user's AFFiNE session (RFC 8693) and replaying it as a session
+ * cookie. Throws {@link TokenExchangeError} on exchange failure so the caller can
+ * decide whether to fall back to the service client.
+ */
+async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLClient> {
+  const { affineSession } = await exchangeUserSession(userAccessToken, {
+    url: config.tokenExchange.url!,
+    proxySecret: config.tokenExchange.proxySecret!,
+  });
+  return new GraphQLClient({
+    endpoint: `${config.baseUrl}${config.graphqlPath}`,
+    cookie: `affine_session=${affineSession}`,
+    // On a 401 (expired/revoked session) drop the cache so the next request for
+    // this subject forces a fresh exchange.
+    onUnauthorized: () => invalidateUserSession(userAccessToken),
+  });
+}
+
+/**
+ * Per-session server build.
+ *
+ * - If the per-user token-exchange path is configured AND the inbound request
+ *   carries the chat user's access token, the GraphQL client acts AS that user
+ *   (session-cookie credential).
+ * - Otherwise — unconfigured, no header, or an exchange failure — it falls back
+ *   to the shared service-credential client (byte-identical to prior behaviour).
+ */
+async function buildServer(req?: Request): Promise<McpServer> {
+  const server = new McpServer({ name: "affine-mcp", version: VERSION });
+
+  let gql: GraphQLClient | undefined;
+  if (isTokenExchangeEnabled()) {
+    const userToken = readUserAccessToken(req);
+    if (userToken) {
+      try {
+        gql = await buildUserGraphQLClient(userToken);
+        console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
+      } catch (err) {
+        const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
+        // Never log the token/secret — TokenExchangeError messages are status-only.
+        console.error(
+          `[affine-mcp] Per-user token exchange failed (${detail}); falling back to service credential.`,
+        );
+      }
+    }
+  }
+  if (!gql) {
+    gql = await buildServiceGraphQLClient();
   }
 
   const originalRegisterTool = (server as any).registerTool?.bind(server);
