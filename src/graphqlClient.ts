@@ -13,8 +13,32 @@ export class GraphQLClient {
   private _headers: Record<string, string>;
   private authenticated: boolean = false;
 
-  constructor(private opts: { endpoint: string; headers?: Record<string, string>; bearer?: string }) {
+  constructor(
+    private opts: {
+      endpoint: string;
+      headers?: Record<string, string>;
+      bearer?: string;
+      /**
+       * Session-cookie credential (e.g. `affine_session=<value>`). Used for the
+       * per-user identity path — a bearer always takes priority if both are set.
+       */
+      cookie?: string;
+      /**
+       * Invoked once when a GraphQL request returns HTTP 401. Used by the per-user
+       * path to invalidate a stale/expired AFFiNE session so the next exchange
+       * refreshes it. The 401 is still thrown to the caller.
+       */
+      onUnauthorized?: () => void;
+    },
+  ) {
     this._headers = { ...(opts.headers || {}) };
+
+    if (opts.cookie) {
+      if (/[\r\n]/.test(opts.cookie)) {
+        throw new Error("Cookie header contains illegal CR/LF characters");
+      }
+      this._headers["Cookie"] = opts.cookie;
+    }
 
     // Set authentication in priority order
     if (opts.bearer) {
@@ -108,6 +132,11 @@ export class GraphQLClient {
         `GraphQL endpoint returned non-JSON response (${res.status} ${res.statusText}, ` +
         `Content-Type: ${contentType || "(none)"}). Body: ${snippet}`
       );
+    }
+
+    if (res.status === 401 && this.opts.onUnauthorized) {
+      // Let the per-user path invalidate its cached session before we throw.
+      try { this.opts.onUnauthorized(); } catch { /* best-effort */ }
     }
 
     if (!res.ok) {

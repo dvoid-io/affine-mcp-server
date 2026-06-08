@@ -21,6 +21,17 @@ export type ServerConfig = {
   oauthIssuerUrl?: string;
   oauthScopes: string[];
   oauthClockSkewSeconds: number;
+  /**
+   * Per-user identity (RFC 8693 token-exchange) settings. The per-user path is
+   * inert unless BOTH `tokenExchange.url` and `tokenExchange.proxySecret` are set —
+   * deployments without these behave byte-identically to before.
+   */
+  tokenExchange: {
+    url?: string;
+    proxySecret?: string;
+    /** Inbound header carrying the chat user's Zitadel access token. */
+    userTokenHeader: string;
+  };
 };
 
 /** Config file location: ~/.config/affine-mcp/config */
@@ -184,6 +195,15 @@ export function loadConfig(): ServerConfig {
     60,
   );
 
+  // Per-user identity via RFC 8693 token-exchange (opt-in). Validate the URL only
+  // when provided so unconfigured deployments are unaffected.
+  const tokenExchangeUrlRaw = env("AFFINE_TOKEN_EXCHANGE_URL", file);
+  const tokenExchangeUrl = tokenExchangeUrlRaw ? validateBaseUrl(tokenExchangeUrlRaw) : undefined;
+  const tokenExchangeProxySecret = env("AFFINE_TRUSTED_PROXY_SECRET", file);
+  const userTokenHeader = (env("DVOID_USER_TOKEN_HEADER", file, "x-dvoid-access-token")!)
+    .trim()
+    .toLowerCase();
+
   return {
     baseUrl,
     apiToken,
@@ -198,5 +218,10 @@ export function loadConfig(): ServerConfig {
     oauthIssuerUrl,
     oauthScopes,
     oauthClockSkewSeconds,
+    tokenExchange: {
+      url: tokenExchangeUrl,
+      proxySecret: tokenExchangeProxySecret,
+      userTokenHeader,
+    },
   };
 }
