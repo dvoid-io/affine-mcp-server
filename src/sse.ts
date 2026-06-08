@@ -170,7 +170,29 @@ export async function startHttpMcpServer(
           }
         };
 
-        const server = await createMcpServer(req);
+        let server: McpServer;
+        try {
+          server = await createMcpServer(req);
+        } catch (err) {
+          // A failed session build — e.g. the per-user token-exchange failed and
+          // buildServer refuses to demote to the service credential — must surface
+          // its real message to the caller, not collapse to a generic 500. This is
+          // the "fail fast + clear error" contract: the chat user / ai-service sees
+          // exactly why their AFFiNE identity could not be established.
+          console.error("[affine-mcp] Failed to establish MCP session:", err);
+          if (!res.headersSent) {
+            res.status(502).json({
+              jsonrpc: "2.0",
+              error: {
+                code: -32001,
+                message:
+                  err instanceof Error ? err.message : "Failed to establish AFFiNE session",
+              },
+              id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+            });
+          }
+          return;
+        }
         await server.connect(transport);
       } else {
         res.status(400).json({
