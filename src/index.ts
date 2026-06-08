@@ -267,18 +267,30 @@ async function buildServer(req?: Request): Promise<McpServer> {
   if (isTokenExchangeEnabled()) {
     const userToken = readUserAccessToken(req);
     if (userToken) {
+      // A user token is present → this request MUST act AS that user. If the
+      // exchange fails even after retries, FAIL FAST with a clear error — never
+      // silently demote to the service credential. The service account is not a
+      // member of the user's workspace, so demoting would read their docs as
+      // empty and could create docs under the wrong identity. A loud failure is
+      // correct: the caller and our logs see exactly what broke, surfacing the
+      // root cause (the AFFiNE token-exchange status + body) instead of masking
+      // it as confusing wrong-identity behaviour.
       try {
         gql = await buildUserGraphQLClientWithRetry(userToken);
         console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
       } catch (err) {
-        const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
-        // Never log the token/secret — TokenExchangeError messages are status-only.
-        console.error(
-          `[affine-mcp] Per-user token exchange failed (${detail}); falling back to service credential.`,
-        );
+        const detail = err instanceof TokenExchangeError ? err.message : String(err);
+        const message =
+          `Per-user AFFiNE identity could not be established (${detail}). ` +
+          `Refusing to fall back to the mcp@dvoid.io service credential — failing ` +
+          `the request so the real cause is visible, not masked as wrong-identity behaviour.`;
+        console.error(`[affine-mcp] ${message}`);
+        throw new TokenExchangeError(message);
       }
     }
   }
+  // No user token (service-to-service: boot-time tools/list, or the per-user
+  // path unconfigured) → the shared service credential is the correct identity.
   if (!gql) {
     gql = await buildServiceGraphQLClient();
   }

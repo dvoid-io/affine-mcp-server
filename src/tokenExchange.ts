@@ -117,9 +117,18 @@ async function performExchange(
   }
 
   if (!res.ok) {
-    // Status only — body may contain sensitive detail; never log token/secret.
+    // The RESPONSE body is AFFiNE's own error payload — it never echoes our
+    // request's subject_token or proxy secret — so it is safe to surface, and
+    // it carries the reason needed to fix the failure (e.g. which check the
+    // verifier rejected). Truncate + collapse whitespace defensively.
+    let body = "";
+    try {
+      body = (await res.text()).slice(0, 400).replace(/\s+/g, " ").trim();
+    } catch {
+      /* body unreadable — fall back to status alone */
+    }
     throw new TokenExchangeError(
-      `Token exchange returned non-2xx status ${res.status}`,
+      `AFFiNE token-exchange returned ${res.status}${body ? `: ${body}` : ""}`,
       res.status,
     );
   }
