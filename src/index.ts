@@ -213,6 +213,44 @@ async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLC
   });
 }
 
+/** Per-attempt backoff (ms) for {@link buildUserGraphQLClientWithRetry}. */
+const EXCHANGE_RETRY_BACKOFF_MS = [250, 600];
+
+/**
+ * Build the per-user client, retrying transient exchange failures before the
+ * caller falls back to the service credential.
+ *
+ * The exchange's email step depends on a Zitadel `userinfo` HTTP call — Zitadel
+ * access tokens carry no `email` claim, so AFFiNE resolves it from userinfo on
+ * every cache-miss. That network call can transiently time out or rate-limit and
+ * surface as a non-2xx (the token itself is valid). A single blip must NOT
+ * silently demote the entire MCP session to the service credential, which is not
+ * a member of the user's workspace and so reads their docs as empty / could
+ * mis-own a create. Retrying with small backoff turns a flaky userinfo into a
+ * reliable per-user session; only after every attempt fails do we fall back.
+ */
+async function buildUserGraphQLClientWithRetry(
+  userAccessToken: string,
+): Promise<GraphQLClient> {
+  let lastErr: unknown;
+  const attempts = EXCHANGE_RETRY_BACKOFF_MS.length + 1;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await buildUserGraphQLClient(userAccessToken);
+    } catch (err) {
+      lastErr = err;
+      const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
+      if (i < attempts - 1) {
+        console.error(
+          `[affine-mcp] Per-user token exchange attempt ${i + 1}/${attempts} failed (${detail}); retrying.`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, EXCHANGE_RETRY_BACKOFF_MS[i]));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Per-session server build.
  *
@@ -230,7 +268,7 @@ async function buildServer(req?: Request): Promise<McpServer> {
     const userToken = readUserAccessToken(req);
     if (userToken) {
       try {
-        gql = await buildUserGraphQLClient(userToken);
+        gql = await buildUserGraphQLClientWithRetry(userToken);
         console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
       } catch (err) {
         const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
