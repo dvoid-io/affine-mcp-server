@@ -27,6 +27,7 @@
     "affine-mcp": "bin/affine-mcp"
   },
   "scripts": {
+    "postinstall": "patch-package",
     "clean": "node -e \"require('fs').rmSync('dist',{ recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
@@ -105,6 +106,7 @@
     "@types/express": "^5.0.6",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^25.2.3",
+    "patch-package": "^8.0.0",
     "tsx": "^4.16.2",
     "typescript": "^6.0.2"
   }
