@@ -86,8 +86,24 @@ function isTokenExchangeEnabled(): boolean {
  * lower-case at load time to match.
  */
 function readUserAccessToken(req: Request | undefined): string | undefined {
+  return readHeaderToken(req, config.tokenExchange.userTokenHeader);
+}
+
+/**
+ * Read the chat user's Zitadel **id_token** from the configured inbound header.
+ * AFFiNE reads the user's `email` from it during token-exchange.
+ */
+function readUserIdToken(req: Request | undefined): string | undefined {
+  return readHeaderToken(req, config.tokenExchange.idTokenHeader);
+}
+
+/** Read + normalise a (possibly `Bearer `-prefixed) token from a request header. */
+function readHeaderToken(
+  req: Request | undefined,
+  header: string,
+): string | undefined {
   if (!req) return undefined;
-  const raw = req.headers[config.tokenExchange.userTokenHeader];
+  const raw = req.headers[header];
   const value = Array.isArray(raw) ? raw[0] : raw;
   const trimmed = typeof value === "string" ? value.trim() : "";
   // Tolerate a `Bearer ` prefix in case the gateway forwards it that way.
@@ -199,8 +215,11 @@ async function buildServiceGraphQLClientImpl(): Promise<GraphQLClient> {
  * cookie. Throws {@link TokenExchangeError} on exchange failure so the caller can
  * decide whether to fall back to the service client.
  */
-async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLClient> {
-  const { affineSession } = await exchangeUserSession(userAccessToken, {
+async function buildUserGraphQLClient(
+  userAccessToken: string,
+  userIdToken: string,
+): Promise<GraphQLClient> {
+  const { affineSession } = await exchangeUserSession(userAccessToken, userIdToken, {
     url: config.tokenExchange.url!,
     proxySecret: config.tokenExchange.proxySecret!,
   });
@@ -217,26 +236,25 @@ async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLC
 const EXCHANGE_RETRY_BACKOFF_MS = [250, 600];
 
 /**
- * Build the per-user client, retrying transient exchange failures before the
- * caller falls back to the service credential.
+ * Build the per-user client, retrying only *transient network* failures of the
+ * RFC 8693 token-exchange POST before giving up.
  *
- * The exchange's email step depends on a Zitadel `userinfo` HTTP call — Zitadel
- * access tokens carry no `email` claim, so AFFiNE resolves it from userinfo on
- * every cache-miss. That network call can transiently time out or rate-limit and
- * surface as a non-2xx (the token itself is valid). A single blip must NOT
- * silently demote the entire MCP session to the service credential, which is not
- * a member of the user's workspace and so reads their docs as empty / could
- * mis-own a create. Retrying with small backoff turns a flaky userinfo into a
- * reliable per-user session; only after every attempt fails do we fall back.
+ * Email no longer depends on a flaky Zitadel `userinfo` hop — AFFiNE reads it
+ * from the id_token we forward (`actor_token`), a deterministic step. The retry
+ * therefore guards a genuine transient (a TCP reset / 5xx blip reaching AFFiNE),
+ * not a masked dependency. A deterministic failure (bad audience, bad id_token,
+ * no email) fails the same on every attempt and surfaces fast. There is no
+ * fallback to the service credential — see `buildServer`.
  */
 async function buildUserGraphQLClientWithRetry(
   userAccessToken: string,
+  userIdToken: string,
 ): Promise<GraphQLClient> {
   let lastErr: unknown;
   const attempts = EXCHANGE_RETRY_BACKOFF_MS.length + 1;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await buildUserGraphQLClient(userAccessToken);
+      return await buildUserGraphQLClient(userAccessToken, userIdToken);
     } catch (err) {
       lastErr = err;
       const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
@@ -267,16 +285,29 @@ async function buildServer(req?: Request): Promise<McpServer> {
   if (isTokenExchangeEnabled()) {
     const userToken = readUserAccessToken(req);
     if (userToken) {
-      // A user token is present → this request MUST act AS that user. If the
-      // exchange fails even after retries, FAIL FAST with a clear error — never
-      // silently demote to the service credential. The service account is not a
-      // member of the user's workspace, so demoting would read their docs as
-      // empty and could create docs under the wrong identity. A loud failure is
-      // correct: the caller and our logs see exactly what broke, surfacing the
-      // root cause (the AFFiNE token-exchange status + body) instead of masking
-      // it as confusing wrong-identity behaviour.
+      // A user token is present → this request MUST act AS that user. The
+      // id_token (carrying the user's email) is REQUIRED for the exchange and
+      // has no fallback — if the caller forwarded an access token but no
+      // id_token, fail fast with a clear error so the missing-plumbing cause is
+      // visible, never silently demoted to the service credential.
+      const userIdToken = readUserIdToken(req);
+      if (!userIdToken) {
+        const message =
+          "Per-user AFFiNE identity requires the user id_token, but the inbound " +
+          `request carried an access token without one (header '${config.tokenExchange.idTokenHeader}'). ` +
+          "Refusing to fall back to the mcp@dvoid.io service credential — the caller " +
+          "must forward the id_token so AFFiNE can resolve the user's email.";
+        console.error(`[affine-mcp] ${message}`);
+        throw new TokenExchangeError(message);
+      }
+      // If the exchange fails even after retries, FAIL FAST with a clear error —
+      // never silently demote to the service credential. The service account is
+      // not a member of the user's workspace, so demoting would read their docs
+      // as empty and could create docs under the wrong identity. A loud failure
+      // surfaces the root cause (the AFFiNE token-exchange status + body) instead
+      // of masking it as confusing wrong-identity behaviour.
       try {
-        gql = await buildUserGraphQLClientWithRetry(userToken);
+        gql = await buildUserGraphQLClientWithRetry(userToken, userIdToken);
         console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
       } catch (err) {
         const detail = err instanceof TokenExchangeError ? err.message : String(err);

@@ -10,6 +10,12 @@ const EXCHANGE_FETCH_TIMEOUT_MS = 30_000;
  */
 const GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
 const SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+/**
+ * The `actor_token` is the user's OIDC **id_token**. AFFiNE reads the user's
+ * `email` from it (the access token carries none for Zitadel-style providers).
+ * Both tokens are required — there is no userinfo fallback on the AFFiNE side.
+ */
+const ACTOR_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token";
 
 /** Refresh a cached session this many seconds before the user token's `exp`. */
 const EXPIRY_SKEW_SECONDS = 30;
@@ -84,6 +90,7 @@ function computeExpiry(userAccessToken: string): number {
 
 async function performExchange(
   userAccessToken: string,
+  userIdToken: string,
   opts: TokenExchangeOptions,
 ): Promise<UserSession> {
   const controller = new AbortController();
@@ -101,6 +108,8 @@ async function performExchange(
         grant_type: GRANT_TYPE,
         subject_token: userAccessToken,
         subject_token_type: SUBJECT_TOKEN_TYPE,
+        actor_token: userIdToken,
+        actor_token_type: ACTOR_TOKEN_TYPE,
       }),
       signal: controller.signal,
     });
@@ -161,12 +170,13 @@ async function performExchange(
  */
 export async function exchangeUserSession(
   userAccessToken: string,
+  userIdToken: string,
   opts: TokenExchangeOptions,
 ): Promise<UserSession> {
   const subject = peekSubject(userAccessToken);
   // No usable subject → still exchange, but bypass the cache (can't key it safely).
   if (!subject) {
-    return performExchange(userAccessToken, opts);
+    return performExchange(userAccessToken, userIdToken, opts);
   }
 
   const now = Date.now();
@@ -177,7 +187,7 @@ export async function exchangeUserSession(
   }
 
   const expiresAtMs = computeExpiry(userAccessToken);
-  const pending = performExchange(userAccessToken, opts)
+  const pending = performExchange(userAccessToken, userIdToken, opts)
     .then((session) => {
       sessionCache.set(subject, { session, expiresAtMs });
       return session;
