@@ -31,6 +31,12 @@ export type ServerConfig = {
     proxySecret?: string;
     /** Inbound header carrying the chat user's Zitadel access token. */
     userTokenHeader: string;
+    /**
+     * Inbound header carrying the chat user's Zitadel **id_token** — AFFiNE
+     * reads the user's `email` from it (the access token carries none). Required
+     * for the per-user path; there is no userinfo fallback.
+     */
+    idTokenHeader: string;
   };
 };
 
@@ -203,6 +209,9 @@ export function loadConfig(): ServerConfig {
   const userTokenHeader = (env("DVOID_USER_TOKEN_HEADER", file, "x-dvoid-access-token")!)
     .trim()
     .toLowerCase();
+  const idTokenHeader = (env("DVOID_USER_ID_TOKEN_HEADER", file, "x-dvoid-id-token")!)
+    .trim()
+    .toLowerCase();
 
   return {
     baseUrl,
@@ -222,6 +231,7 @@ export function loadConfig(): ServerConfig {
       url: tokenExchangeUrl,
       proxySecret: tokenExchangeProxySecret,
       userTokenHeader,
+      idTokenHeader,
     },
   };
 }
