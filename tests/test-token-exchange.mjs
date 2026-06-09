@@ -96,15 +96,11 @@ async function testCase(name, fn) {
 const future = Math.floor(Date.now() / 1000) + 3600;
 const userA = makeJwt({ sub: "user-A", exp: future });
 const userB = makeJwt({ sub: "user-B", exp: future });
-// id_tokens (RFC 8693 actor_token) — carry the email AFFiNE resolves. The
-// client only forwards them; it never verifies them.
-const userAId = makeJwt({ sub: "user-A", email: "user-a@affine.pro", exp: future });
-const userBId = makeJwt({ sub: "user-B", email: "user-b@affine.pro", exp: future });
 
 // 1. Happy path: correct POST shape + RFC 8693 body, returns affineSession.
 await testCase("happy path issues affineSession with RFC 8693 body + proxy secret", async () => {
   ok("affine-sess-1");
-  const { affineSession } = await exchangeUserSession(userA, userAId, opts);
+  const { affineSession } = await exchangeUserSession(userA, opts);
   assert.equal(affineSession, "affine-sess-1");
   assert.equal(requestLog.length, 1, "exactly one exchange request");
   const r = requestLog[0];
@@ -115,16 +111,13 @@ await testCase("happy path issues affineSession with RFC 8693 body + proxy secre
   assert.equal(parsed.grant_type, "urn:ietf:params:oauth:grant-type:token-exchange");
   assert.equal(parsed.subject_token, userA);
   assert.equal(parsed.subject_token_type, "urn:ietf:params:oauth:token-type:access_token");
-  // RFC 8693 actor_token = the user's id_token (carries the email AFFiNE reads).
-  assert.equal(parsed.actor_token, userAId);
-  assert.equal(parsed.actor_token_type, "urn:ietf:params:oauth:token-type:id_token");
 });
 
 // 2. Cache hit: second call for same sub does not re-hit the endpoint.
 await testCase("cache hit avoids a second exchange for the same subject", async () => {
   ok("affine-sess-2");
-  const first = await exchangeUserSession(userA, userAId, opts);
-  const second = await exchangeUserSession(userA, userAId, opts);
+  const first = await exchangeUserSession(userA, opts);
+  const second = await exchangeUserSession(userA, opts);
   assert.equal(first.affineSession, "affine-sess-2");
   assert.equal(second.affineSession, "affine-sess-2");
   assert.equal(requestLog.length, 1, "second call served from cache");
@@ -133,17 +126,17 @@ await testCase("cache hit avoids a second exchange for the same subject", async 
 // 3. Distinct subject re-exchanges.
 await testCase("distinct subject triggers a fresh exchange", async () => {
   ok("shared");
-  await exchangeUserSession(userA, userAId, opts);
-  await exchangeUserSession(userB, userBId, opts);
+  await exchangeUserSession(userA, opts);
+  await exchangeUserSession(userB, opts);
   assert.equal(requestLog.length, 2, "each subject exchanged once");
 });
 
 // 4. invalidateUserSession forces a re-exchange.
 await testCase("invalidateUserSession forces re-exchange on next call", async () => {
   ok("sess");
-  await exchangeUserSession(userA, userAId, opts);
+  await exchangeUserSession(userA, opts);
   invalidateUserSession(userA);
-  await exchangeUserSession(userA, userAId, opts);
+  await exchangeUserSession(userA, opts);
   assert.equal(requestLog.length, 2, "invalidation re-exchanged");
 });
 
@@ -152,7 +145,7 @@ await testCase("non-2xx throws TokenExchangeError with status and no secret leak
   fail(403);
   let err;
   try {
-    await exchangeUserSession(userA, userAId, opts);
+    await exchangeUserSession(userA, opts);
   } catch (e) {
     err = e;
   }
@@ -172,8 +165,8 @@ await testCase("concurrent calls for same subject dedupe to one exchange", async
       res.end(JSON.stringify({ access_token: "concurrent" }));
     };
   };
-  const p1 = exchangeUserSession(userA, userAId, opts);
-  const p2 = exchangeUserSession(userA, userAId, opts);
+  const p1 = exchangeUserSession(userA, opts);
+  const p2 = exchangeUserSession(userA, opts);
   await new Promise((r) => setTimeout(r, 20));
   resolveResp();
   const [a, b] = await Promise.all([p1, p2]);
