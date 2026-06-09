@@ -97,6 +97,24 @@ function readUserAccessToken(req: Request | undefined): string | undefined {
 }
 
 /**
+ * True when the inbound request is a service-to-service **tool enumeration**
+ * (ai-service's boot/refresh `tools/list`), marked with `x-dvoid-mcp-enumerate`.
+ *
+ * Enumeration is identity-agnostic — tool schemas are the same for every user —
+ * and the enumerating caller is a client-credentials service identity with no
+ * provisioned AFFiNE `sub`, so per-user resolution would (correctly) fail. The
+ * marker is set server-side by ai-service on the enumeration connection ONLY,
+ * never on a user tool call, so an end user cannot influence it. Such requests
+ * use the shared service credential rather than the per-user path.
+ */
+function isServiceEnumeration(req: Request | undefined): boolean {
+  if (!req) return false;
+  const raw = req.headers["x-dvoid-mcp-enumerate"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
  * The shared service-credential GraphQL client. Built once on first use and
  * reused for every session that does NOT carry a per-user token — byte-identical
  * to the prior singleton behaviour (including the async email/password login
@@ -265,7 +283,9 @@ async function buildServer(req?: Request): Promise<McpServer> {
 
   let gql: GraphQLClient | undefined;
   if (isTokenExchangeEnabled()) {
-    const userToken = readUserAccessToken(req);
+    // Service enumeration (tools/list) uses the shared service credential — it
+    // is identity-agnostic and the enumerating identity has no provisioned sub.
+    const userToken = isServiceEnumeration(req) ? undefined : readUserAccessToken(req);
     if (userToken) {
       // A user token is present → this request MUST act AS that user. If the
       // exchange fails even after retries, FAIL FAST with a clear error — never
