@@ -21,6 +21,7 @@ import { existsSync } from "fs";
 import { CONFIG_FILE } from "./config.js";
 import { createToolFilter, toolFilterRequiresRegisterTool } from "./toolSurface.js";
 import { exchangeUserSession, invalidateUserSession, TokenExchangeError } from "./tokenExchange.js";
+import { getBrokerIdentity } from "./broker.js";
 import type { Request } from "express";
 
 // CLI commands: affine-mcp login|status|logout|version
@@ -73,6 +74,16 @@ for (const warning of toolFilter.warnings) {
 
 if (config.authMode === "oauth" && !useHttpTransport) {
   throw new Error("AFFINE_MCP_AUTH_MODE=oauth requires MCP_TRANSPORT=http (or streamable/sse).");
+}
+if (config.authMode === "broker") {
+  if (!useHttpTransport) {
+    throw new Error("AFFINE_MCP_AUTH_MODE=broker requires MCP_TRANSPORT=http (or streamable/sse).");
+  }
+  // Broker mode exists to act AS the verified user; without the per-user exchange
+  // every request would silently run as the service account.
+  if (!(config.tokenExchange.url && config.tokenExchange.proxySecret)) {
+    throw new Error("AFFINE_MCP_AUTH_MODE=broker requires AFFINE_TOKEN_EXCHANGE_URL and AFFINE_TRUSTED_PROXY_SECRET.");
+  }
 }
 
 /** True when the per-user token-exchange path is configured (both URL + secret). */
@@ -282,7 +293,31 @@ async function buildServer(req?: Request): Promise<McpServer> {
   const server = new McpServer({ name: "affine-mcp", version: VERSION });
 
   let gql: GraphQLClient | undefined;
-  if (isTokenExchangeEnabled()) {
+  if (config.authMode === "broker") {
+    // The identity is the verified, broker-minted bearer and nothing else: no
+    // header (x-dvoid-mcp-enumerate, x-dvoid-access-token, …) is read in this mode.
+    const identity = getBrokerIdentity(req);
+    if (!identity) {
+      throw new TokenExchangeError("No verified broker identity on the request.");
+    }
+    if (identity.isService) {
+      // A configured service subject (ai-service enumerating tools): the shared
+      // service credential, chosen by WHO the token is, never by a marker header.
+      gql = await buildServiceGraphQLClient();
+    } else {
+      try {
+        gql = await buildUserGraphQLClientWithRetry(identity.token);
+        console.error("[affine-mcp] Using per-user AFFiNE session (broker token)");
+      } catch (err) {
+        const detail = err instanceof TokenExchangeError ? err.message : String(err);
+        const message =
+          `Per-user AFFiNE identity could not be established (${detail}). ` +
+          `Refusing to fall back to the service credential.`;
+        console.error(`[affine-mcp] ${message}`);
+        throw new TokenExchangeError(message);
+      }
+    }
+  } else if (isTokenExchangeEnabled()) {
     // Service enumeration (tools/list) uses the shared service credential — it
     // is identity-agnostic and the enumerating identity has no provisioned sub.
     const userToken = isServiceEnumeration(req) ? undefined : readUserAccessToken(req);
@@ -345,7 +380,8 @@ async function buildServer(req?: Request): Promise<McpServer> {
   registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerUserTools(server, gql);
   registerUserCRUDTools(server, gql);
-  if (config.authMode !== "oauth") {
+  // Sign-in tools would let a caller swap the identity the token established.
+  if (config.authMode === "bearer") {
     registerAuthTools(server, gql, config.baseUrl);
   }
   registerAccessTokenTools(server, gql);

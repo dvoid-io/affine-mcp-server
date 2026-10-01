@@ -62,6 +62,7 @@
     "test:oauth-http": "node tests/test-oauth-http.mjs",
     "test:token-exchange": "npx tsx tests/test-token-exchange.mjs",
     "test:per-user-identity": "npm run build && node tests/test-per-user-identity.mjs",
+    "test:broker-auth": "npm run build && node tests/test-broker-auth.mjs",
     "test:organize": "node tests/test-organize-tools.mjs",
     "test:create-doc-folder-placement": "node tests/test-create-doc-folder-placement.mjs",
     "test:supporting-tools": "node tests/test-supporting-tools.mjs",

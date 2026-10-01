@@ -16,7 +16,7 @@ export type ServerConfig = {
   email?: string;
   password?: string;
   defaultWorkspaceId?: string;
-  authMode: "bearer" | "oauth";
+  authMode: AuthMode;
   publicBaseUrl?: string;
   oauthIssuerUrl?: string;
   oauthScopes: string[];
@@ -32,7 +32,20 @@ export type ServerConfig = {
     /** Inbound header carrying the chat user's Zitadel access token. */
     userTokenHeader: string;
   };
+  /**
+   * Broker mode (AFFINE_MCP_AUTH_MODE=broker): the bearer is a token the gateway's
+   * broker minted, verified here (src/broker.ts). Unset outside broker mode.
+   */
+  broker?: {
+    issuerUrl?: string;
+    audience: string;
+    allowedActors: string[];
+    actorClaim: string;
+    serviceSubjects: string[];
+  };
 };
+
+export type AuthMode = "bearer" | "oauth" | "broker";
 
 /** Config file location: ~/.config/affine-mcp/config */
 const CONFIG_DIR = path.join(
@@ -144,13 +157,17 @@ function parseHeadersJson(raw?: string): Record<string, string> | undefined {
   }
 }
 
-function parseAuthMode(raw: string | undefined): "bearer" | "oauth" {
+function parseAuthMode(raw: string | undefined): AuthMode {
   if (!raw) return "bearer";
   const normalized = raw.trim().toLowerCase();
-  if (normalized === "bearer" || normalized === "oauth") {
+  if (normalized === "bearer" || normalized === "oauth" || normalized === "broker") {
     return normalized;
   }
-  throw new Error(`Invalid AFFINE_MCP_AUTH_MODE: ${raw}. Expected 'bearer' or 'oauth'.`);
+  throw new Error(`Invalid AFFINE_MCP_AUTH_MODE: ${raw}. Expected 'bearer', 'oauth' or 'broker'.`);
+}
+
+function parseList(raw: string | undefined): string[] {
+  return (raw || "").split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
 }
 
 function parseOAuthScopes(raw: string | undefined): string[] {
@@ -204,6 +221,17 @@ export function loadConfig(): ServerConfig {
     .trim()
     .toLowerCase();
 
+  const brokerIssuerRaw = env("AFFINE_BROKER_ISSUER_URL", file);
+  const broker = authMode === "broker"
+    ? {
+        issuerUrl: brokerIssuerRaw ? validateBaseUrl(brokerIssuerRaw) : undefined,
+        audience: (env("AFFINE_BROKER_AUDIENCE", file) || "").trim(),
+        allowedActors: parseList(env("AFFINE_BROKER_ALLOWED_ACTORS", file)),
+        actorClaim: (env("AFFINE_BROKER_ACTOR_CLAIM", file, "act.sub") || "act.sub").trim(),
+        serviceSubjects: parseList(env("AFFINE_BROKER_SERVICE_SUBJECTS", file)),
+      }
+    : undefined;
+
   return {
     baseUrl,
     apiToken,
@@ -223,5 +251,6 @@ export function loadConfig(): ServerConfig {
       proxySecret: tokenExchangeProxySecret,
       userTokenHeader,
     },
+    broker,
   };
 }

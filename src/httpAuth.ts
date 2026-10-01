@@ -2,6 +2,12 @@ import type express from "express";
 import type { NextFunction, Request, Response } from "express";
 
 import type { ServerConfig } from "./config.js";
+import {
+  type BrokerConfig,
+  setBrokerIdentity,
+  validateBrokerConfig,
+  verifyBrokerToken,
+} from "./broker.js";
 import type { OAuthConfig } from "./oauth.js";
 import {
   buildOAuthProtectedResourceMetadata,
@@ -15,6 +21,7 @@ export type HttpAuthState = {
   authMiddleware: (req: Request, res: Response, next: NextFunction) => void;
   httpAuthToken?: string;
   oauthConfig: OAuthConfig | null;
+  brokerConfig: BrokerConfig | null;
   protectedResourceMetadataUrl: string | null;
   protectedResourceMetadataPaths: string[];
 };
@@ -55,6 +62,7 @@ export function createHttpAuthState(
   opts: { allowAnyOrigin: boolean; httpAuthToken?: string },
 ): HttpAuthState {
   let oauthConfig: OAuthConfig | null = null;
+  let brokerConfig: BrokerConfig | null = null;
   let protectedResourceMetadataUrl: string | null = null;
   let protectedResourceMetadataPaths: string[] = [];
 
@@ -76,8 +84,56 @@ export function createHttpAuthState(
     protectedResourceMetadataPaths = getOAuthProtectedResourceMetadataPaths(oauthConfig.publicBaseUrl);
   }
 
+  if (config.authMode === "broker") {
+    if (!config.broker?.issuerUrl) {
+      throw new Error("AFFINE_BROKER_ISSUER_URL is required when AFFINE_MCP_AUTH_MODE=broker.");
+    }
+    brokerConfig = {
+      issuerUrl: config.broker.issuerUrl,
+      audience: config.broker.audience,
+      allowedActors: config.broker.allowedActors,
+      actorClaim: config.broker.actorClaim,
+      serviceSubjects: config.broker.serviceSubjects,
+      clockSkewSeconds: config.oauthClockSkewSeconds,
+    };
+    validateBrokerConfig(brokerConfig, opts);
+  }
+
   const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
     if (req.method === "OPTIONS") return next();
+
+    // Broker mode: the only credential is the minted bearer, and the only identity
+    // is the one it carries. Nothing else on the request is read for auth.
+    if (config.authMode === "broker") {
+      const refuse = (error: string, description: string) => {
+        res.set("WWW-Authenticate", `Bearer error="${error}", error_description="${description.replace(/"/g, "'")}"`);
+        res.status(401).json(buildOAuthErrorResponse(error, description));
+      };
+      if (!brokerConfig) {
+        res.status(500).json(buildOAuthErrorResponse("server_error", "Broker configuration was not initialized."));
+        return;
+      }
+      if (typeof req.query.token === "string") {
+        refuse("invalid_request", "Query parameter token is not allowed in broker mode.");
+        return;
+      }
+      const header = req.headers.authorization;
+      const raw = Array.isArray(header) ? header[0] : header;
+      const bearer = raw ? /^Bearer\s+(\S+)$/i.exec(raw) : null;
+      if (!bearer) {
+        refuse("invalid_token", "A broker-minted bearer token is required.");
+        return;
+      }
+      void verifyBrokerToken(bearer[1], brokerConfig)
+        .then((identity) => {
+          setBrokerIdentity(req, identity);
+          next();
+        })
+        .catch((error) => {
+          refuse("invalid_token", error instanceof Error ? error.message : "Token verification failed.");
+        });
+      return;
+    }
 
     if (config.authMode === "oauth") {
       if (!oauthConfig) {
@@ -171,6 +227,7 @@ export function createHttpAuthState(
     authMiddleware,
     httpAuthToken: opts.httpAuthToken,
     oauthConfig,
+    brokerConfig,
     protectedResourceMetadataUrl,
     protectedResourceMetadataPaths,
   };
