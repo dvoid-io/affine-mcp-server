@@ -15,7 +15,7 @@ export function registerHttpDiagnosticsRoutes(
     res.json({
       status: "ok",
       authMode: config.authMode,
-      protected: config.authMode === "oauth" || Boolean(authState.httpAuthToken),
+      protected: config.authMode !== "bearer" || Boolean(authState.httpAuthToken),
     });
   });
 
@@ -40,6 +40,25 @@ export function registerHttpDiagnosticsRoutes(
         });
         return;
       }
+    }
+
+    if (config.authMode === "broker" && authState.brokerConfig) {
+      try {
+        const readiness = await probeOAuthReadiness({
+          publicBaseUrl: "",
+          issuerUrl: authState.brokerConfig.issuerUrl,
+          scopes: [],
+          clockSkewSeconds: authState.brokerConfig.clockSkewSeconds,
+        });
+        res.json({ status: "ok", authMode: "broker", issuer: readiness.issuer, jwksUri: readiness.jwksUri });
+      } catch (error) {
+        res.status(503).json({
+          status: "not_ready",
+          authMode: "broker",
+          error: error instanceof Error ? error.message : "Broker issuer readiness check failed.",
+        });
+      }
+      return;
     }
 
     res.json({

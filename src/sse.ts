@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerConfig } from "./config.js";
 import { registerHttpDiagnosticsRoutes } from "./httpDiagnostics.js";
 import { createHttpAuthState, registerHttpAuthRoutes } from "./httpAuth.js";
+import { getBrokerIdentity } from "./broker.js";
 
 export async function startHttpMcpServer(
   createMcpServer: (req?: Request) => Promise<McpServer>,
@@ -117,6 +118,14 @@ export async function startHttpMcpServer(
     StreamableHTTPServerTransport | SSEServerTransport
   > = {};
 
+  // Broker mode: a session belongs to the subject whose token opened it. A later
+  // request on that session must carry a token for the same subject, so one
+  // user's valid token can never drive another user's AFFiNE session.
+  const sessionOwners: Record<string, string> = {};
+  const brokerMode = config.authMode === "broker";
+  const ownerMismatch = (sid: string, req: Request): boolean =>
+    brokerMode && sessionOwners[sid] !== getBrokerIdentity(req)?.subject;
+
   // ===========================================================================
   // STREAMABLE HTTP TRANSPORT — MCP protocol 2025-03-26
   // Single endpoint /mcp (GET / POST / DELETE) replaces the old two-endpoint SSE
@@ -133,6 +142,14 @@ export async function startHttpMcpServer(
       const existing = sessionId ? transports[sessionId] : undefined;
 
       if (existing instanceof StreamableHTTPServerTransport) {
+        if (sessionId && ownerMismatch(sessionId, req)) {
+          res.status(403).json({
+            jsonrpc: "2.0",
+            error: { code: -32003, message: "Forbidden: this session belongs to another subject" },
+            id: null,
+          });
+          return;
+        }
         transport = existing;
       } else if (!sessionId && req.method === "POST") {
         // Parse body only for the initialize POST (lazy — avoids consuming the stream early).
@@ -159,6 +176,8 @@ export async function startHttpMcpServer(
               `[affine-mcp] StreamableHTTP session initialized: ${sid}`,
             );
             transports[sid] = transport;
+            const owner = getBrokerIdentity(req)?.subject;
+            if (brokerMode && owner) sessionOwners[sid] = owner;
           },
         });
 
@@ -167,6 +186,7 @@ export async function startHttpMcpServer(
           if (sid && transports[sid]) {
             console.error(`[affine-mcp] StreamableHTTP session closed: ${sid}`);
             delete transports[sid];
+            delete sessionOwners[sid];
           }
         };
 
@@ -239,10 +259,13 @@ export async function startHttpMcpServer(
       const transport = new SSEServerTransport("/messages", res);
       const sessionId = transport.sessionId;
       transports[sessionId] = transport;
+      const owner = getBrokerIdentity(req)?.subject;
+      if (brokerMode && owner) sessionOwners[sessionId] = owner;
 
       res.on("close", () => {
         console.error(`[affine-mcp] Legacy SSE session closed: ${sessionId}`);
         delete transports[sessionId];
+        delete sessionOwners[sessionId];
       });
 
       const server = await createMcpServer(req);
@@ -273,6 +296,10 @@ export async function startHttpMcpServer(
       }
 
       const transport = transports[sessionId];
+      if (transport && ownerMismatch(sessionId, req)) {
+        res.status(403).send("Forbidden: this session belongs to another subject");
+        return;
+      }
       if (!(transport instanceof SSEServerTransport)) {
         res.status(400).json({
           jsonrpc: "2.0",
