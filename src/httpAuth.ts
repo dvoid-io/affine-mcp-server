@@ -91,8 +91,6 @@ export function createHttpAuthState(
     brokerConfig = {
       issuerUrl: config.broker.issuerUrl,
       audience: config.broker.audience,
-      allowedActors: config.broker.allowedActors,
-      actorClaim: config.broker.actorClaim,
       serviceSubjects: config.broker.serviceSubjects,
       clockSkewSeconds: config.oauthClockSkewSeconds,
     };

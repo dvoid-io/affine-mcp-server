@@ -10,11 +10,13 @@
  *     exactly that bearer as its subject token;
  *   - ai-service's own subject → the shared service credential, no exchange;
  *   - client-sent x-dvoid-mcp-enumerate / x-dvoid-access-token → ignored;
- *   - wrong aud, wrong issuer, no act, a disallowed actor, expired, an unknown
- *     kid, alg none, HS256 keyed with the RSA public key → 401;
+ *   - any actor of the issuer passes: no list of actors is kept;
+ *   - another server's audience, the MCP project's alone, a wrong issuer, no act
+ *     (a user's own login token), an act from another issuer or with no sub,
+ *     expired, an unknown kid, alg none, HS256 keyed with the RSA public key → 401;
  *   - one subject's token on another subject's session → 403;
- *   - broker mode refuses to start without the per-user exchange, or with a
- *     shared AFFINE_MCP_HTTP_TOKEN.
+ *   - broker mode refuses to start without the per-user exchange, with a shared
+ *     AFFINE_MCP_HTTP_TOKEN, without an audience, or with a retired actor setting.
  *
  * Run after `npm run build`:  node tests/test-broker-auth.mjs
  */
@@ -22,6 +24,7 @@ import http from "node:http";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { createHmac } from "node:crypto";
@@ -31,11 +34,17 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_PATH = path.resolve(__dirname, "..", "dist", "index.js");
+if (!existsSync(MCP_SERVER_PATH)) {
+  // A missing prerequisite is NOT RUN (77), never a failure and never a pass.
+  console.error("tests/test-broker-auth.mjs: no dist/ — run `npm run build` first");
+  process.exit(77);
+}
 
 const SERVICE_TOKEN = "service-api-token";
 const PROXY_SECRET = "trusted-proxy-secret";
 const EXCHANGED_SESSION = "exchanged-affine-session-xyz";
-const PROJECT = "386781285248407674";
+const PROJECT = "386781285248407674";        // this server's own audience project
+const MCP_PROJECT = "369468423408728336";    // the MCP project: the gateway's audience, not ours
 const GATEWAY = "svc-agentgateway";
 const AI_SERVICE = "svc-ai-service";
 
@@ -130,7 +139,7 @@ const now = () => Math.floor(Date.now() / 1000);
 async function mint(claims, opts = {}) {
   const key = opts.key ?? issuerKey.privateKey;
   const kid = opts.kid ?? "issuer-1";
-  return await new SignJWT({ aud: [PROJECT, "client-id-x"], act: { sub: GATEWAY }, ...claims })
+  return await new SignJWT({ aud: [PROJECT], act: { iss: ISSUER, sub: GATEWAY }, ...claims })
     .setProtectedHeader({ alg: "RS256", kid })
     .setIssuer(opts.iss ?? ISSUER)
     .setIssuedAt()
@@ -163,7 +172,6 @@ function startMcp(port, extraEnv = {}) {
       AFFINE_MCP_AUTH_MODE: "broker",
       AFFINE_BROKER_ISSUER_URL: ISSUER,
       AFFINE_BROKER_AUDIENCE: PROJECT,
-      AFFINE_BROKER_ALLOWED_ACTORS: GATEWAY,
       AFFINE_BROKER_SERVICE_SUBJECTS: AI_SERVICE,
       AFFINE_TOOL_PROFILE: "full",
       XDG_CONFIG_HOME: "/tmp/affine-broker-test-" + Date.now(),
@@ -270,18 +278,24 @@ try {
     assert.ok(exchangeSubjects.every((t) => t === userToken));
   });
 
+  const anyActor = await rawPost(url, await mint({ sub: "user-A", act: { iss: ISSUER, sub: "svc-actor-of-another-org" } }));
+  await check("any actor of the issuer is accepted: no list of actors to maintain", () =>
+    assert.equal(anyActor.status, 200, anyActor.text.slice(0, 200)));
+
   console.log("refused (401) before any session exists");
   const refusals = [
     ["no Authorization header", null],
-    ["a wrong audience", await mint({ sub: "user-A", aud: ["some-other-project"] })],
+    ["a token minted for another server (its own project as aud)", await mint({ sub: "user-A", aud: ["another-server-project"] })],
+    ["the MCP project's aud alone (the gateway's audience, not this server's)", await mint({ sub: "user-A", aud: [MCP_PROJECT, "client-id-x"] })],
     ["a wrong issuer", await mint({ sub: "user-A" }, { iss: "https://evil.example" })],
-    ["no act claim", await mint({ sub: "user-A", act: undefined })],
-    ["an actor that is not the broker", await mint({ sub: "user-A", act: { sub: "svc-someone-else" } })],
+    ["no act claim: a user's own token with this server's aud", await mint({ sub: "user-A", aud: [PROJECT, MCP_PROJECT, "client-id-x"], act: undefined })],
+    ["an act from another issuer", await mint({ sub: "user-A", act: { iss: "https://evil.example", sub: GATEWAY } })],
+    ["an act with no sub", await mint({ sub: "user-A", act: { iss: ISSUER } })],
     ["an expired token", await mint({ sub: "user-A" }, { exp: now() - 3600 })],
     ["a key the issuer never published (unknown kid)", await mint({ sub: "user-A" }, { key: strangerKey.privateKey, kid: "stranger" })],
     ["a stranger's key under the issuer's kid", await mint({ sub: "user-A" }, { key: strangerKey.privateKey })],
-    ["alg none", unsigned({ iss: ISSUER, aud: [PROJECT], sub: "user-A", act: { sub: GATEWAY }, exp: now() + 3600 })],
-    ["HS256 keyed with the issuer's public key", hs256WithPublicKey({ iss: ISSUER, aud: [PROJECT], sub: "user-A", act: { sub: GATEWAY }, exp: now() + 3600 })],
+    ["alg none", unsigned({ iss: ISSUER, aud: [PROJECT], sub: "user-A", act: { iss: ISSUER, sub: GATEWAY }, exp: now() + 3600 })],
+    ["HS256 keyed with the issuer's public key", hs256WithPublicKey({ iss: ISSUER, aud: [PROJECT], sub: "user-A", act: { iss: ISSUER, sub: GATEWAY }, exp: now() + 3600 })],
   ];
   for (const [name, token] of refusals) {
     exchangeSubjects.length = 0;
@@ -344,11 +358,18 @@ try {
     assert.notEqual(sharedToken.code, "running");
     assert.match(sharedToken.err, /AFFINE_MCP_HTTP_TOKEN is not allowed/);
   });
-  const noActors = await exitsNonZero({ AFFINE_BROKER_ALLOWED_ACTORS: "" });
-  await check("without allowed actors it will not start", () => {
-    assert.notEqual(noActors.code, "running");
-    assert.match(noActors.err, /AFFINE_BROKER_ALLOWED_ACTORS is required/);
+  const noAudience = await exitsNonZero({ AFFINE_BROKER_AUDIENCE: "" });
+  await check("without an audience it will not start", () => {
+    assert.notEqual(noAudience.code, "running");
+    assert.match(noAudience.err, /AFFINE_BROKER_AUDIENCE is required/);
   });
+  for (const retired of ["AFFINE_BROKER_ALLOWED_ACTORS", "AFFINE_BROKER_ACTOR_CLAIM"]) {
+    const r = await exitsNonZero({ [retired]: "x" });
+    await check(`with the retired ${retired} set it will not start`, () => {
+      assert.notEqual(r.code, "running");
+      assert.match(r.err, new RegExp(`${retired} is retired`));
+    });
+  }
 } catch (e) {
   failures++;
   console.error("FAIL (harness):", e);

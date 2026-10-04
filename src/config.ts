@@ -39,8 +39,6 @@ export type ServerConfig = {
   broker?: {
     issuerUrl?: string;
     audience: string;
-    allowedActors: string[];
-    actorClaim: string;
     serviceSubjects: string[];
   };
 };
@@ -226,11 +224,19 @@ export function loadConfig(): ServerConfig {
     ? {
         issuerUrl: brokerIssuerRaw ? validateBaseUrl(brokerIssuerRaw) : undefined,
         audience: (env("AFFINE_BROKER_AUDIENCE", file) || "").trim(),
-        allowedActors: parseList(env("AFFINE_BROKER_ALLOWED_ACTORS", file)),
-        actorClaim: (env("AFFINE_BROKER_ACTOR_CLAIM", file, "act.sub") || "act.sub").trim(),
         serviceSubjects: parseList(env("AFFINE_BROKER_SERVICE_SUBJECTS", file)),
       }
     : undefined;
+  if (broker) {
+    // Retired with the per-server audience (src/broker.ts): the audience is the boundary,
+    // and any actor of the issuer passes. A leftover list would read as a restriction that
+    // no longer exists, so its presence refuses to start rather than being ignored.
+    for (const retired of ["AFFINE_BROKER_ALLOWED_ACTORS", "AFFINE_BROKER_ACTOR_CLAIM"]) {
+      if (env(retired, file)) {
+        throw new Error(`${retired} is retired: broker mode checks aud = this server's own project and an act from the issuer. Remove it.`);
+      }
+    }
+  }
 
   return {
     baseUrl,

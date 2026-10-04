@@ -14,18 +14,20 @@ import {
  *
  * What a valid token is:
  *   - signed by the issuer's JWKS with an asymmetric algorithm (never `none` or HMAC);
- *   - `iss` is the configured issuer; `aud` contains the configured audience
- *     (the MCP project id); `exp`, `sub` are present;
- *   - the actor claim (default `act.sub`) names one of the allowed actors: the
- *     gateway's own service user. A token without it was not minted for us by
- *     the broker, even if every other check passes.
+ *   - `iss` is the configured issuer; `exp`, `sub` are present;
+ *   - `aud` contains the configured audience: THIS server's own project. Each brokered
+ *     server has its own, and the broker asks for exactly one per exchange, so a token
+ *     minted for any other server is refused here (D45, per-server audience);
+ *   - an `act` claim is present, and `act.iss` is the issuer. Only a token exchange sets
+ *     `act`; a user's own login token never carries one. Without this check, a user who
+ *     got a token with this server's aud from any client could call this server directly
+ *     and skip the gateway's per-tool rules. Which actor it was is the gateway's and
+ *     Zitadel's business (one actor per org, each an impersonator in its own org only),
+ *     so no list of actors is kept here.
  */
 export type BrokerConfig = {
   issuerUrl: string;
   audience: string;
-  allowedActors: string[];
-  /** Dotted path to the immediate actor's id in the payload. */
-  actorClaim: string;
   /** Subjects that act as the shared service credential (ai-service's tool enumeration). */
   serviceSubjects: string[];
   clockSkewSeconds: number;
@@ -35,6 +37,7 @@ export type BrokerIdentity = {
   /** The verified bearer, handed on to AFFiNE's own exchange as the subject token. */
   token: string;
   subject: string;
+  /** `act.sub`: the actor Zitadel recorded for the exchange. */
   actor: string;
   /** True when the subject is a configured service subject: use the service credential. */
   isService: boolean;
@@ -53,25 +56,10 @@ export function validateBrokerConfig(config: BrokerConfig, opts: { httpAuthToken
     throw new Error("AFFINE_MCP_HTTP_TOKEN is not allowed when AFFINE_MCP_AUTH_MODE=broker: the gateway presents a minted token, not a shared one.");
   }
   if (!config.audience) throw new Error("AFFINE_BROKER_AUDIENCE is required when AFFINE_MCP_AUTH_MODE=broker.");
-  if (config.allowedActors.length === 0) {
-    throw new Error("AFFINE_BROKER_ALLOWED_ACTORS is required when AFFINE_MCP_AUTH_MODE=broker.");
-  }
-  if (!/^[A-Za-z0-9_:-]+(\.[A-Za-z0-9_:-]+)*$/.test(config.actorClaim)) {
-    throw new Error(`AFFINE_BROKER_ACTOR_CLAIM must be a dotted claim path. Received: ${config.actorClaim}`);
-  }
   const issuer = new URL(config.issuerUrl);
   if (issuer.protocol !== "https:" && !["localhost", "127.0.0.1", "::1"].includes(issuer.hostname)) {
     throw new Error("AFFINE_BROKER_ISSUER_URL must use HTTPS for non-local deployments.");
   }
-}
-
-function readClaimPath(payload: JWTPayload, dotted: string): unknown {
-  let cur: unknown = payload;
-  for (const part of dotted.split(".")) {
-    if (!cur || typeof cur !== "object" || Array.isArray(cur)) return undefined;
-    cur = (cur as Record<string, unknown>)[part];
-  }
-  return cur;
 }
 
 /**
@@ -106,13 +94,13 @@ export async function verifyBrokerToken(
 
   const subject = typeof payload.sub === "string" ? payload.sub.trim() : "";
   if (!subject) throw new BrokerTokenError("token has an empty sub");
-  const actor = readClaimPath(payload, config.actorClaim);
-  if (typeof actor !== "string" || !actor) {
-    throw new BrokerTokenError(`token carries no actor at ${config.actorClaim}: it was not minted by the broker`);
+  const act = payload.act;
+  if (!act || typeof act !== "object" || Array.isArray(act)) {
+    throw new BrokerTokenError("token carries no act claim: it was not minted by a token exchange");
   }
-  if (!config.allowedActors.includes(actor)) {
-    throw new BrokerTokenError(`actor at ${config.actorClaim} is not an allowed broker`);
-  }
+  const { iss: actIssuer, sub: actor } = act as Record<string, unknown>;
+  if (actIssuer !== issuer) throw new BrokerTokenError("act.iss is not the issuer");
+  if (typeof actor !== "string" || !actor) throw new BrokerTokenError("act.sub is empty");
   return {
     token,
     subject,
