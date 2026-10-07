@@ -1,0 +1,180 @@
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/zod-json-schema-compat.js b/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/zod-json-schema-compat.js
+index bc067da..4ac8638 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/zod-json-schema-compat.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/cjs/server/zod-json-schema-compat.js
+@@ -44,18 +44,78 @@ function mapMiniTarget(t) {
+     return 'draft-7'; // fallback
+ }
+ function toJsonSchemaCompat(schema, opts) {
++    let result;
+     if ((0, zod_compat_js_1.isZ4Schema)(schema)) {
+         // v4 branch — use Mini's built-in toJSONSchema
+-        return z4mini.toJSONSchema(schema, {
++        result = z4mini.toJSONSchema(schema, {
+             target: mapMiniTarget(opts?.target),
+             io: opts?.pipeStrategy ?? 'input'
+         });
+     }
+-    // v3 branch — use vendored converter
+-    return (0, zod_to_json_schema_1.zodToJsonSchema)(schema, {
+-        strictUnions: opts?.strictUnions ?? true,
+-        pipeStrategy: opts?.pipeStrategy ?? 'input'
+-    });
++    else {
++        // v3 branch — use vendored converter
++        result = (0, zod_to_json_schema_1.zodToJsonSchema)(schema, {
++            strictUnions: opts?.strictUnions ?? true,
++            pipeStrategy: opts?.pipeStrategy ?? 'input'
++        });
++    }
++    // Strip the $schema dialect header (draft-07) that both Zod→JSON paths stamp
++    // by default. Anthropic's Messages API tool validator requires draft-2020-12
++    // and rejects the whole schema when it sees a draft-07 declaration at the root,
++    // even if the schema body itself is valid under 2020-12. Upstream fix is PR
++    // #1432 on modelcontextprotocol/typescript-sdk (closed unmerged as of 2026-04).
++    // Applies to BOTH v3 (zod-to-json-schema) and v4 (z4mini.toJSONSchema with
++    // default target 'draft-7') code paths — the v4 branch matters because
++    // `inputSchema: {}` gets wrapped as z4mini.object({}) by getZodSchemaObject.
++    if (result && typeof result === 'object' && '$schema' in result) {
++        delete result.$schema;
++    }
++    // Anthropic rejects property schemas with no type/enum/const/combinator.
++    // Zod z.any()/z.unknown() serialize to {} or {description: ...} which are valid
++    // JSON Schema but fail Anthropic's strict validator. Walk the emitted schema
++    // and inject a permissive JSON-value type union into any typeless property.
++    injectTypesForTypelessProps(result);
++    return result;
++}
++const ANY_JSON_VALUE_TYPE = ['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'];
++function hasShapeKeyword(s) {
++    return s && typeof s === 'object' && (
++        'type' in s || 'enum' in s || 'const' in s ||
++        'anyOf' in s || 'oneOf' in s || 'allOf' in s || '$ref' in s
++    );
++}
++function injectTypesForTypelessProps(schema) {
++    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return;
++    if (schema.properties && typeof schema.properties === 'object') {
++        for (const key of Object.keys(schema.properties)) {
++            const prop = schema.properties[key];
++            if (prop && typeof prop === 'object' && !Array.isArray(prop) && !hasShapeKeyword(prop)) {
++                prop.type = ANY_JSON_VALUE_TYPE.slice();
++            }
++            injectTypesForTypelessProps(prop);
++        }
++    }
++    if (schema.additionalProperties && typeof schema.additionalProperties === 'object' && !Array.isArray(schema.additionalProperties)) {
++        if (!hasShapeKeyword(schema.additionalProperties)) {
++            schema.additionalProperties.type = ANY_JSON_VALUE_TYPE.slice();
++        }
++        injectTypesForTypelessProps(schema.additionalProperties);
++    }
++    if (schema.items) {
++        if (Array.isArray(schema.items)) {
++            for (const it of schema.items) injectTypesForTypelessProps(it);
++        } else {
++            injectTypesForTypelessProps(schema.items);
++        }
++    }
++    if (Array.isArray(schema.prefixItems)) {
++        for (const it of schema.prefixItems) injectTypesForTypelessProps(it);
++    }
++    for (const comp of ['anyOf', 'oneOf', 'allOf']) {
++        if (Array.isArray(schema[comp])) {
++            for (const inner of schema[comp]) injectTypesForTypelessProps(inner);
++        }
++    }
+ }
+ function getMethodLiteral(schema) {
+     const shape = (0, zod_compat_js_1.getObjectShape)(schema);
+diff --git a/node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-json-schema-compat.js b/node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-json-schema-compat.js
+index 62f7fd0..2f8f05e 100644
+--- a/node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-json-schema-compat.js
++++ b/node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-json-schema-compat.js
+@@ -16,18 +16,80 @@ function mapMiniTarget(t) {
+     return 'draft-7'; // fallback
+ }
+ export function toJsonSchemaCompat(schema, opts) {
++    let result;
+     if (isZ4Schema(schema)) {
+         // v4 branch — use Mini's built-in toJSONSchema
+-        return z4mini.toJSONSchema(schema, {
++        result = z4mini.toJSONSchema(schema, {
+             target: mapMiniTarget(opts?.target),
+             io: opts?.pipeStrategy ?? 'input'
+         });
+     }
+-    // v3 branch — use vendored converter
+-    return zodToJsonSchema(schema, {
+-        strictUnions: opts?.strictUnions ?? true,
+-        pipeStrategy: opts?.pipeStrategy ?? 'input'
+-    });
++    else {
++        // v3 branch — use vendored converter
++        result = zodToJsonSchema(schema, {
++            strictUnions: opts?.strictUnions ?? true,
++            pipeStrategy: opts?.pipeStrategy ?? 'input'
++        });
++    }
++    // Strip the $schema dialect header (draft-07) that both Zod→JSON paths stamp
++    // by default. Anthropic's Messages API tool validator requires draft-2020-12
++    // and rejects the whole schema when it sees a draft-07 declaration at the root,
++    // even if the schema body itself is valid under 2020-12. Upstream fix is PR
++    // #1432 on modelcontextprotocol/typescript-sdk (closed unmerged as of 2026-04).
++    // Applies to BOTH v3 (zod-to-json-schema) and v4 (z4mini.toJSONSchema with
++    // default target 'draft-7') code paths — the v4 branch matters because
++    // `inputSchema: {}` gets wrapped as z4mini.object({}) by getZodSchemaObject.
++    if (result && typeof result === 'object' && '$schema' in result) {
++        delete result.$schema;
++    }
++    // Anthropic also rejects property schemas with no type/enum/const/combinator.
++    // Zod's z.any() and z.unknown() serialize to `{}` or `{description: "..."}`
++    // which are valid JSON Schema but fail Anthropic's strict validator. Walk the
++    // emitted schema and inject a permissive JSON-value type union into any typeless
++    // property. Catches every current + future z.any()/z.unknown() usage at the
++    // protocol boundary so handler code keeps its escape-hatch semantics.
++    injectTypesForTypelessProps(result);
++    return result;
++}
++const ANY_JSON_VALUE_TYPE = ['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'];
++function hasShapeKeyword(s) {
++    return s && typeof s === 'object' && (
++        'type' in s || 'enum' in s || 'const' in s ||
++        'anyOf' in s || 'oneOf' in s || 'allOf' in s || '$ref' in s
++    );
++}
++function injectTypesForTypelessProps(schema) {
++    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return;
++    if (schema.properties && typeof schema.properties === 'object') {
++        for (const key of Object.keys(schema.properties)) {
++            const prop = schema.properties[key];
++            if (prop && typeof prop === 'object' && !Array.isArray(prop) && !hasShapeKeyword(prop)) {
++                prop.type = ANY_JSON_VALUE_TYPE.slice();
++            }
++            injectTypesForTypelessProps(prop);
++        }
++    }
++    if (schema.additionalProperties && typeof schema.additionalProperties === 'object' && !Array.isArray(schema.additionalProperties)) {
++        if (!hasShapeKeyword(schema.additionalProperties)) {
++            schema.additionalProperties.type = ANY_JSON_VALUE_TYPE.slice();
++        }
++        injectTypesForTypelessProps(schema.additionalProperties);
++    }
++    if (schema.items) {
++        if (Array.isArray(schema.items)) {
++            for (const it of schema.items) injectTypesForTypelessProps(it);
++        } else {
++            injectTypesForTypelessProps(schema.items);
++        }
++    }
++    if (Array.isArray(schema.prefixItems)) {
++        for (const it of schema.prefixItems) injectTypesForTypelessProps(it);
++    }
++    for (const comp of ['anyOf', 'oneOf', 'allOf']) {
++        if (Array.isArray(schema[comp])) {
++            for (const s of schema[comp]) injectTypesForTypelessProps(s);
++        }
++    }
+ }
+ export function getMethodLiteral(schema) {
+     const shape = getObjectShape(schema);

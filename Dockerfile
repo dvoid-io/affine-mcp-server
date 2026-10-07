@@ -5,8 +5,10 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies first (layer cache)
+# Install dependencies first (layer cache).
+# patches/ must be copied BEFORE `npm ci` so the postinstall hook can apply them.
 COPY package*.json ./
+COPY patches/ ./patches/
 RUN npm ci
 
 # Copy source and build TypeScript
