@@ -16,12 +16,34 @@ export type ServerConfig = {
   email?: string;
   password?: string;
   defaultWorkspaceId?: string;
-  authMode: "bearer" | "oauth";
+  authMode: AuthMode;
   publicBaseUrl?: string;
   oauthIssuerUrl?: string;
   oauthScopes: string[];
   oauthClockSkewSeconds: number;
+  /**
+   * Per-user identity (RFC 8693 token-exchange) settings. The per-user path is
+   * inert unless BOTH `tokenExchange.url` and `tokenExchange.proxySecret` are set —
+   * deployments without these behave byte-identically to before.
+   */
+  tokenExchange: {
+    url?: string;
+    proxySecret?: string;
+    /** Inbound header carrying the chat user's Zitadel access token. */
+    userTokenHeader: string;
+  };
+  /**
+   * Broker mode (AFFINE_MCP_AUTH_MODE=broker): the bearer is a token the gateway's
+   * broker minted, verified here (src/broker.ts). Unset outside broker mode.
+   */
+  broker?: {
+    issuerUrl?: string;
+    audience: string;
+    serviceSubjects: string[];
+  };
 };
+
+export type AuthMode = "bearer" | "oauth" | "broker";
 
 /** Config file location: ~/.config/affine-mcp/config */
 const CONFIG_DIR = path.join(
@@ -133,13 +155,17 @@ function parseHeadersJson(raw?: string): Record<string, string> | undefined {
   }
 }
 
-function parseAuthMode(raw: string | undefined): "bearer" | "oauth" {
+function parseAuthMode(raw: string | undefined): AuthMode {
   if (!raw) return "bearer";
   const normalized = raw.trim().toLowerCase();
-  if (normalized === "bearer" || normalized === "oauth") {
+  if (normalized === "bearer" || normalized === "oauth" || normalized === "broker") {
     return normalized;
   }
-  throw new Error(`Invalid AFFINE_MCP_AUTH_MODE: ${raw}. Expected 'bearer' or 'oauth'.`);
+  throw new Error(`Invalid AFFINE_MCP_AUTH_MODE: ${raw}. Expected 'bearer', 'oauth' or 'broker'.`);
+}
+
+function parseList(raw: string | undefined): string[] {
+  return (raw || "").split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
 }
 
 function parseOAuthScopes(raw: string | undefined): string[] {
@@ -184,6 +210,34 @@ export function loadConfig(): ServerConfig {
     60,
   );
 
+  // Per-user identity via RFC 8693 token-exchange (opt-in). Validate the URL only
+  // when provided so unconfigured deployments are unaffected.
+  const tokenExchangeUrlRaw = env("AFFINE_TOKEN_EXCHANGE_URL", file);
+  const tokenExchangeUrl = tokenExchangeUrlRaw ? validateBaseUrl(tokenExchangeUrlRaw) : undefined;
+  const tokenExchangeProxySecret = env("AFFINE_TRUSTED_PROXY_SECRET", file);
+  const userTokenHeader = (env("DVOID_USER_TOKEN_HEADER", file, "x-dvoid-access-token")!)
+    .trim()
+    .toLowerCase();
+
+  const brokerIssuerRaw = env("AFFINE_BROKER_ISSUER_URL", file);
+  const broker = authMode === "broker"
+    ? {
+        issuerUrl: brokerIssuerRaw ? validateBaseUrl(brokerIssuerRaw) : undefined,
+        audience: (env("AFFINE_BROKER_AUDIENCE", file) || "").trim(),
+        serviceSubjects: parseList(env("AFFINE_BROKER_SERVICE_SUBJECTS", file)),
+      }
+    : undefined;
+  if (broker) {
+    // Retired with the per-server audience (src/broker.ts): the audience is the boundary,
+    // and any actor of the issuer passes. A leftover list would read as a restriction that
+    // no longer exists, so its presence refuses to start rather than being ignored.
+    for (const retired of ["AFFINE_BROKER_ALLOWED_ACTORS", "AFFINE_BROKER_ACTOR_CLAIM"]) {
+      if (env(retired, file)) {
+        throw new Error(`${retired} is retired: broker mode checks aud = this server's own project and an act from the issuer. Remove it.`);
+      }
+    }
+  }
+
   return {
     baseUrl,
     apiToken,
@@ -198,5 +252,11 @@ export function loadConfig(): ServerConfig {
     oauthIssuerUrl,
     oauthScopes,
     oauthClockSkewSeconds,
+    tokenExchange: {
+      url: tokenExchangeUrl,
+      proxySecret: tokenExchangeProxySecret,
+      userTokenHeader,
+    },
+    broker,
   };
 }

@@ -20,6 +20,9 @@ import { startHttpMcpServer } from "./sse.js";
 import { existsSync } from "fs";
 import { CONFIG_FILE } from "./config.js";
 import { createToolFilter, toolFilterRequiresRegisterTool } from "./toolSurface.js";
+import { exchangeUserSession, invalidateUserSession, TokenExchangeError } from "./tokenExchange.js";
+import { getBrokerIdentity } from "./broker.js";
+import type { Request } from "express";
 
 // CLI commands: affine-mcp login|status|logout|version
 const rawArgs = process.argv.slice(2);
@@ -72,9 +75,72 @@ for (const warning of toolFilter.warnings) {
 if (config.authMode === "oauth" && !useHttpTransport) {
   throw new Error("AFFINE_MCP_AUTH_MODE=oauth requires MCP_TRANSPORT=http (or streamable/sse).");
 }
+if (config.authMode === "broker") {
+  if (!useHttpTransport) {
+    throw new Error("AFFINE_MCP_AUTH_MODE=broker requires MCP_TRANSPORT=http (or streamable/sse).");
+  }
+  // Broker mode exists to act AS the verified user; without the per-user exchange
+  // every request would silently run as the service account.
+  if (!(config.tokenExchange.url && config.tokenExchange.proxySecret)) {
+    throw new Error("AFFINE_MCP_AUTH_MODE=broker requires AFFINE_TOKEN_EXCHANGE_URL and AFFINE_TRUSTED_PROXY_SECRET.");
+  }
+}
 
-async function buildServer() {
-  const server = new McpServer({ name: "affine-mcp", version: VERSION });
+/** True when the per-user token-exchange path is configured (both URL + secret). */
+function isTokenExchangeEnabled(): boolean {
+  return !!(config.tokenExchange.url && config.tokenExchange.proxySecret);
+}
+
+/**
+ * Read the chat user's Zitadel access token from the configured inbound header.
+ * Express lower-cases header names; the configured header name is normalised to
+ * lower-case at load time to match.
+ */
+function readUserAccessToken(req: Request | undefined): string | undefined {
+  if (!req) return undefined;
+  const raw = req.headers[config.tokenExchange.userTokenHeader];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  // Tolerate a `Bearer ` prefix in case the gateway forwards it that way.
+  const bearer = /^Bearer\s+(.+)$/i.exec(trimmed);
+  const token = bearer ? bearer[1] : trimmed;
+  return token || undefined;
+}
+
+/**
+ * True when the inbound request is a service-to-service **tool enumeration**
+ * (ai-service's boot/refresh `tools/list`), marked with `x-dvoid-mcp-enumerate`.
+ *
+ * Enumeration is identity-agnostic — tool schemas are the same for every user —
+ * and the enumerating caller is a client-credentials service identity with no
+ * provisioned AFFiNE `sub`, so per-user resolution would (correctly) fail. The
+ * marker is set server-side by ai-service on the enumeration connection ONLY,
+ * never on a user tool call, so an end user cannot influence it. Such requests
+ * use the shared service credential rather than the per-user path.
+ */
+function isServiceEnumeration(req: Request | undefined): boolean {
+  if (!req) return false;
+  const raw = req.headers["x-dvoid-mcp-enumerate"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * The shared service-credential GraphQL client. Built once on first use and
+ * reused for every session that does NOT carry a per-user token — byte-identical
+ * to the prior singleton behaviour (including the async email/password login
+ * that mutates this instance after construction).
+ */
+let serviceGqlClientPromise: Promise<GraphQLClient> | undefined;
+
+function buildServiceGraphQLClient(): Promise<GraphQLClient> {
+  if (serviceGqlClientPromise) return serviceGqlClientPromise;
+  serviceGqlClientPromise = buildServiceGraphQLClientImpl();
+  return serviceGqlClientPromise;
+}
+
+async function buildServiceGraphQLClientImpl(): Promise<GraphQLClient> {
+
   const gqlHeaders = { ...(config.headers || {}) };
   const gqlBearer = config.apiToken;
 
@@ -153,6 +219,137 @@ async function buildServer() {
     console.error("Set AFFINE_API_TOKEN or run: affine-mcp login");
   }
 
+  return gql;
+}
+
+/**
+ * Build a per-user GraphQL client by exchanging the chat user's Zitadel access
+ * token for that user's AFFiNE session (RFC 8693) and replaying it as a session
+ * cookie. Throws {@link TokenExchangeError} on exchange failure so the caller can
+ * decide whether to fall back to the service client.
+ */
+async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLClient> {
+  const { affineSession } = await exchangeUserSession(userAccessToken, {
+    url: config.tokenExchange.url!,
+    proxySecret: config.tokenExchange.proxySecret!,
+  });
+  return new GraphQLClient({
+    endpoint: `${config.baseUrl}${config.graphqlPath}`,
+    cookie: `affine_session=${affineSession}`,
+    // On a 401 (expired/revoked session) drop the cache so the next request for
+    // this subject forces a fresh exchange.
+    onUnauthorized: () => invalidateUserSession(userAccessToken),
+  });
+}
+
+/** Per-attempt backoff (ms) for {@link buildUserGraphQLClientWithRetry}. */
+const EXCHANGE_RETRY_BACKOFF_MS = [250, 600];
+
+/**
+ * Build the per-user client, retrying transient exchange failures before the
+ * caller falls back to the service credential.
+ *
+ * The exchange's email step depends on a Zitadel `userinfo` HTTP call — Zitadel
+ * access tokens carry no `email` claim, so AFFiNE resolves it from userinfo on
+ * every cache-miss. That network call can transiently time out or rate-limit and
+ * surface as a non-2xx (the token itself is valid). A single blip must NOT
+ * silently demote the entire MCP session to the service credential, which is not
+ * a member of the user's workspace and so reads their docs as empty / could
+ * mis-own a create. Retrying with small backoff turns a flaky userinfo into a
+ * reliable per-user session; only after every attempt fails do we fall back.
+ */
+async function buildUserGraphQLClientWithRetry(
+  userAccessToken: string,
+): Promise<GraphQLClient> {
+  let lastErr: unknown;
+  const attempts = EXCHANGE_RETRY_BACKOFF_MS.length + 1;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await buildUserGraphQLClient(userAccessToken);
+    } catch (err) {
+      lastErr = err;
+      const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
+      if (i < attempts - 1) {
+        console.error(
+          `[affine-mcp] Per-user token exchange attempt ${i + 1}/${attempts} failed (${detail}); retrying.`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, EXCHANGE_RETRY_BACKOFF_MS[i]));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Per-session server build.
+ *
+ * - If the per-user token-exchange path is configured AND the inbound request
+ *   carries the chat user's access token, the GraphQL client acts AS that user
+ *   (session-cookie credential).
+ * - Otherwise — unconfigured, no header, or an exchange failure — it falls back
+ *   to the shared service-credential client (byte-identical to prior behaviour).
+ */
+async function buildServer(req?: Request): Promise<McpServer> {
+  const server = new McpServer({ name: "affine-mcp", version: VERSION });
+
+  let gql: GraphQLClient | undefined;
+  if (config.authMode === "broker") {
+    // The identity is the verified, broker-minted bearer and nothing else: no
+    // header (x-dvoid-mcp-enumerate, x-dvoid-access-token, …) is read in this mode.
+    const identity = getBrokerIdentity(req);
+    if (!identity) {
+      throw new TokenExchangeError("No verified broker identity on the request.");
+    }
+    if (identity.isService) {
+      // A configured service subject (ai-service enumerating tools): the shared
+      // service credential, chosen by WHO the token is, never by a marker header.
+      gql = await buildServiceGraphQLClient();
+    } else {
+      try {
+        gql = await buildUserGraphQLClientWithRetry(identity.token);
+        console.error("[affine-mcp] Using per-user AFFiNE session (broker token)");
+      } catch (err) {
+        const detail = err instanceof TokenExchangeError ? err.message : String(err);
+        const message =
+          `Per-user AFFiNE identity could not be established (${detail}). ` +
+          `Refusing to fall back to the service credential.`;
+        console.error(`[affine-mcp] ${message}`);
+        throw new TokenExchangeError(message);
+      }
+    }
+  } else if (isTokenExchangeEnabled()) {
+    // Service enumeration (tools/list) uses the shared service credential — it
+    // is identity-agnostic and the enumerating identity has no provisioned sub.
+    const userToken = isServiceEnumeration(req) ? undefined : readUserAccessToken(req);
+    if (userToken) {
+      // A user token is present → this request MUST act AS that user. If the
+      // exchange fails even after retries, FAIL FAST with a clear error — never
+      // silently demote to the service credential. The service account is not a
+      // member of the user's workspace, so demoting would read their docs as
+      // empty and could create docs under the wrong identity. A loud failure is
+      // correct: the caller and our logs see exactly what broke, surfacing the
+      // root cause (the AFFiNE token-exchange status + body) instead of masking
+      // it as confusing wrong-identity behaviour.
+      try {
+        gql = await buildUserGraphQLClientWithRetry(userToken);
+        console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
+      } catch (err) {
+        const detail = err instanceof TokenExchangeError ? err.message : String(err);
+        const message =
+          `Per-user AFFiNE identity could not be established (${detail}). ` +
+          `Refusing to fall back to the mcp@dvoid.io service credential — failing ` +
+          `the request so the real cause is visible, not masked as wrong-identity behaviour.`;
+        console.error(`[affine-mcp] ${message}`);
+        throw new TokenExchangeError(message);
+      }
+    }
+  }
+  // No user token (service-to-service: boot-time tools/list, or the per-user
+  // path unconfigured) → the shared service credential is the correct identity.
+  if (!gql) {
+    gql = await buildServiceGraphQLClient();
+  }
+
   const originalRegisterTool = (server as any).registerTool?.bind(server);
   if (typeof originalRegisterTool !== "function") {
     const message =
@@ -183,7 +380,8 @@ async function buildServer() {
   registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   registerUserTools(server, gql);
   registerUserCRUDTools(server, gql);
-  if (config.authMode !== "oauth") {
+  // Sign-in tools would let a caller swap the identity the token established.
+  if (config.authMode === "bearer") {
     registerAuthTools(server, gql, config.baseUrl);
   }
   registerAccessTokenTools(server, gql);
