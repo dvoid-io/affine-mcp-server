@@ -63,6 +63,7 @@
     "test:token-exchange": "npx tsx tests/test-token-exchange.mjs",
     "test:per-user-identity": "npm run build && node tests/test-per-user-identity.mjs",
     "test:broker-auth": "npm run build && node tests/test-broker-auth.mjs",
+    "test:broker-security": "node tests/test-broker-security.mjs && node tests/test-token-exchange-security.mjs",
     "test:organize": "node tests/test-organize-tools.mjs",
     "test:create-doc-folder-placement": "node tests/test-create-doc-folder-placement.mjs",
     "test:supporting-tools": "node tests/test-supporting-tools.mjs",
@@ -71,7 +72,7 @@
     "test:markdown-rich-text-import": "node tests/test-markdown-rich-text-import.mjs",
     "test:playwright": "npx playwright test --config tests/playwright/playwright.config.ts",
     "pack:check": "npm pack --dry-run",
-    "ci": "npm run build && npm run test:tool-manifest && npm run pack:check",
+    "ci": "npm run build && npm run test:tool-manifest && npm run test:broker-security && npm run pack:check",
     "prepublishOnly": "npm run ci"
   },
   "files": [

@@ -88,10 +88,35 @@ async function performExchange(
 ): Promise<UserSession> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), EXCHANGE_FETCH_TIMEOUT_MS);
+  try {
+    // Keep the deadline through body consumption as well as response headers.
+    // A stalled body must not pin the per-subject in-flight cache indefinitely.
+    return await readExchange(userAccessToken, opts, controller.signal);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new TokenExchangeError(
+        `Token exchange timed out after ${EXCHANGE_FETCH_TIMEOUT_MS / 1000}s`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readExchange(
+  userAccessToken: string,
+  opts: TokenExchangeOptions,
+  signal: AbortSignal,
+): Promise<UserSession> {
   let res;
   try {
     res = await fetch(opts.url, {
       method: "POST",
+      // This POST carries both the subject token and the trusted-proxy secret.
+      // Following a redirect can forward them to a different origin; configure
+      // the final exchange endpoint instead of trusting a redirect response.
+      redirect: "error",
       headers: {
         "Content-Type": "application/json",
         "User-Agent": `affine-mcp-server/${VERSION}`,
@@ -102,18 +127,11 @@ async function performExchange(
         subject_token: userAccessToken,
         subject_token_type: SUBJECT_TOKEN_TYPE,
       }),
-      signal: controller.signal,
+      signal,
     });
-  } catch (err: any) {
-    if (err?.name === "AbortError") {
-      throw new TokenExchangeError(
-        `Token exchange timed out after ${EXCHANGE_FETCH_TIMEOUT_MS / 1000}s`,
-      );
-    }
+  } catch {
     // Never surface the underlying message — it could echo the request body.
     throw new TokenExchangeError("Token exchange request failed (network error)");
-  } finally {
-    clearTimeout(timer);
   }
 
   if (!res.ok) {

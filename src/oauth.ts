@@ -131,6 +131,22 @@ export async function loadAuthorizationServerMetadata(issuerUrl: string): Promis
       if (!("jwks_uri" in discovered) || typeof discovered.jwks_uri !== "string" || !discovered.jwks_uri) {
         throw new Error(`Authorization server metadata from ${issuerUrl} did not provide jwks_uri`);
       }
+      // Discovery describes the configured issuer; it cannot select another one
+      // whose tokens we will trust (OIDC Discovery 1.0 section 4.3).
+      // Keep an exact configured trailing slash valid, while retaining the
+      // existing convenience of configuring a slash for a slashless issuer.
+      if (discovered.issuer !== issuerUrl && discovered.issuer !== issuerUrl.replace(/\/+$/, "")) {
+        throw new Error("Authorization server metadata issuer does not match the configured issuer");
+      }
+      const jwksUrl = new URL(discovered.jwks_uri);
+      const configuredIssuer = new URL(issuerUrl);
+      // A separate HTTPS key host is valid. Plain HTTP is only for an explicitly
+      // local HTTP deployment, never a transport downgrade chosen by metadata.
+      const localHttp = configuredIssuer.protocol === "http:" && isLoopbackUrl(issuerUrl)
+        && jwksUrl.protocol === "http:" && isLoopbackUrl(discovered.jwks_uri);
+      if (jwksUrl.protocol !== "https:" && !localHttp) {
+        throw new Error("Authorization server jwks_uri must use HTTPS outside local HTTP deployments");
+      }
       return {
         issuer: discovered.issuer,
         jwks_uri: discovered.jwks_uri,

@@ -117,6 +117,19 @@ export function validateBaseUrl(input: string): string {
   return parsed.origin + parsed.pathname.replace(/\/$/, "");
 }
 
+function validateIssuerUrl(input: string): string {
+  const normalized = validateBaseUrl(input);
+  const parsed = new URL(input);
+  // Issuer identifiers exclude query and fragment components, including empty
+  // ones; URL.search/hash alone omit their empty delimiters.
+  if (parsed.href.includes("?") || parsed.href.includes("#")) {
+    throw new Error("Issuer URL must not contain a query or fragment");
+  }
+  // Retain the existing scheme/host/path normalization, restoring only an
+  // explicitly supplied trailing slash because it is part of issuer identity.
+  return input.trim().endsWith("/") && parsed.pathname.endsWith("/") ? `${normalized}/` : normalized;
+}
+
 /**
  * Helper: read env var with config file fallback.
  * Environment variables always take priority over the config file.
@@ -202,7 +215,7 @@ export function loadConfig(): ServerConfig {
   const publicBaseUrlRaw = env("AFFINE_MCP_PUBLIC_BASE_URL", file);
   const oauthIssuerUrlRaw = env("AFFINE_OAUTH_ISSUER_URL", file);
   const publicBaseUrl = publicBaseUrlRaw ? validateBaseUrl(publicBaseUrlRaw) : undefined;
-  const oauthIssuerUrl = oauthIssuerUrlRaw ? validateBaseUrl(oauthIssuerUrlRaw) : undefined;
+  const oauthIssuerUrl = oauthIssuerUrlRaw ? validateIssuerUrl(oauthIssuerUrlRaw) : undefined;
   const oauthScopes = parseOAuthScopes(env("AFFINE_OAUTH_SCOPES", file, "mcp"));
   const oauthClockSkewSeconds = parsePositiveIntegerEnv(
     "AFFINE_OAUTH_CLOCK_SKEW_SECONDS",
@@ -222,7 +235,7 @@ export function loadConfig(): ServerConfig {
   const brokerIssuerRaw = env("AFFINE_BROKER_ISSUER_URL", file);
   const broker = authMode === "broker"
     ? {
-        issuerUrl: brokerIssuerRaw ? validateBaseUrl(brokerIssuerRaw) : undefined,
+        issuerUrl: brokerIssuerRaw ? validateIssuerUrl(brokerIssuerRaw) : undefined,
         audience: (env("AFFINE_BROKER_AUDIENCE", file) || "").trim(),
         serviceSubjects: parseList(env("AFFINE_BROKER_SERVICE_SUBJECTS", file)),
       }

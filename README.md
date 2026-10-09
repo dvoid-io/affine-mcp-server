@@ -221,6 +221,18 @@ For common failures, see:
 - Restrict exposed tools with `AFFINE_DISABLED_GROUPS` and `AFFINE_DISABLED_TOOLS` for least-privilege setups
 - Use `/healthz` and `/readyz` when running the HTTP server behind a container platform or load balancer
 
+OAuth and broker discovery require metadata to name the configured issuer and
+provide an HTTPS `jwks_uri`. Keys may live on a separate HTTPS host. Local HTTP
+keys are accepted only when the configured issuer also uses local HTTP.
+The exact configured issuer is accepted, including a trailing slash; configuring
+a trailing slash for a slashless issuer also retains its existing behavior.
+Issuer configuration retains URL normalization and refuses query or fragment components.
+`AFFINE_TOKEN_EXCHANGE_URL` must be the final endpoint: token exchange refuses
+redirects, including redirects to the same origin, to keep the subject token and
+trusted-proxy secret at the configured destination.
+The exchange's 30-second deadline includes reading its response body; a timed-out
+exchange is removed from the cache so the next request can retry.
+
 ## Development
 
 Run the main quality gates before opening a PR:
@@ -228,8 +240,12 @@ Run the main quality gates before opening a PR:
 ```bash
 npm run build
 npm run test:tool-manifest
+npm run test:broker-security
 npm run pack:check
 ```
+
+The broker security runners import `dist`: build first as above, or run
+`npm run ci`, which builds before all these checks.
 
 Additional validation:
 

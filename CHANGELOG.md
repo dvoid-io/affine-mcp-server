@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Require OAuth discovery metadata to match the configured issuer and use HTTPS for public signing keys, preserving explicit local HTTP deployments and separate HTTPS key hosts.
+- Refuse token-exchange redirects so subject tokens and trusted-proxy secrets stay at the configured endpoint.
+- Keep the token-exchange deadline active through success and error response bodies, allowing a fresh exchange after a stalled response times out.
+- Add socket-free signed-token, discovery, exchange, and session-cache regressions to CI.
+
 ## [2.1.0] - 2026-05-21
 
 ### Added
