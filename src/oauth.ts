@@ -16,12 +16,12 @@ export type OAuthAccessTokenInfo = {
   subject: string | null;
 };
 
-type AuthorizationServerMetadata = {
+export type AuthorizationServerMetadata = {
   issuer: string;
   jwks_uri?: string;
 };
 
-const ALLOWED_JWT_ALGORITHMS = [
+export const ALLOWED_JWT_ALGORITHMS = [
   "RS256",
   "RS384",
   "RS512",
@@ -120,7 +120,7 @@ function getScopesFromPayload(payload: JWTPayload): string[] {
   return [...scopes];
 }
 
-async function loadAuthorizationServerMetadata(issuerUrl: string): Promise<AuthorizationServerMetadata> {
+export async function loadAuthorizationServerMetadata(issuerUrl: string): Promise<AuthorizationServerMetadata> {
   let pending = metadataCache.get(issuerUrl);
   if (!pending) {
     pending = (async () => {
@@ -152,7 +152,7 @@ export async function probeOAuthReadiness(config: OAuthConfig): Promise<{ issuer
   };
 }
 
-function getJwks(metadata: AuthorizationServerMetadata) {
+export function getJwks(metadata: AuthorizationServerMetadata) {
   if (!metadata.jwks_uri) {
     throw new Error("Authorization server metadata is missing jwks_uri");
   }
