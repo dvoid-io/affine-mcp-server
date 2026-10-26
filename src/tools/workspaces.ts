@@ -5,7 +5,56 @@ import * as Y from "yjs";
 import FormData from "form-data";
 import fetch from "node-fetch";
 import { receipt, text } from "../util/mcp.js";
-import { connectWorkspaceSocket, joinWorkspace, pushDocUpdate, wsUrlFromGraphQLEndpoint } from "../ws.js";
+import { connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, wsUrlFromGraphQLEndpoint } from "../ws.js";
+
+// Per-workspace ceiling for resolving the human-readable name from its root
+// YDoc. Name resolution is best-effort metadata enrichment; it must never
+// stall or break the workspace list, so each lookup is bounded.
+const WORKSPACE_NAME_RESOLVE_TIMEOUT_MS = Number(
+  process.env.AFFINE_WS_NAME_RESOLVE_TIMEOUT_MS || 8000,
+);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+// Resolve a workspace's human-readable name from its root YDoc `meta.name`.
+// The root doc's docId is identical to the workspaceId (mirrors the read path
+// used by list_docs in docs.ts: loadDoc(socket, wsId, wsId) -> applyUpdate ->
+// getMap("meta")). WorkspaceType has no `name` field over GraphQL, so this is
+// the only source of truth. Returns undefined on any failure.
+async function resolveWorkspaceName(
+  wsUrl: string,
+  cookie: string,
+  bearer: string,
+  workspaceId: string,
+): Promise<string | undefined> {
+  let socket: Awaited<ReturnType<typeof connectWorkspaceSocket>> | undefined;
+  try {
+    socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    await joinWorkspace(socket, workspaceId);
+    const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+    if (!snapshot.missing) return undefined;
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+    const name = doc.getMap("meta").get("name");
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } finally {
+    socket?.disconnect();
+  }
+}
 
 // Generate AFFiNE-style document ID
 function generateDocId(): string {
@@ -137,7 +186,33 @@ export function registerWorkspaceTools(server: McpServer, gql: GraphQLClient) {
     try {
       const query = `query { workspaces { id public enableAi createdAt } }`;
       const data = await gql.request<{ workspaces: any[] }>(query);
-      return text(data.workspaces || []);
+      const workspaces = data.workspaces || [];
+
+      // WorkspaceType has no `name` field over GraphQL. Enrich each workspace
+      // with its human-readable name, read from the root YDoc `meta.name`.
+      // Resolved in parallel; per-workspace timeout + allSettled guarantee a
+      // single slow/failed lookup never blocks or breaks the whole list.
+      const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
+      const cookie = gql.cookie;
+      const bearer = gql.bearer;
+
+      const names = await Promise.allSettled(
+        workspaces.map((ws) =>
+          withTimeout(
+            resolveWorkspaceName(wsUrl, cookie, bearer, ws.id),
+            WORKSPACE_NAME_RESOLVE_TIMEOUT_MS,
+            `resolve workspace name ${ws.id}`,
+          ),
+        ),
+      );
+
+      const enriched = workspaces.map((ws, i) => {
+        const r = names[i];
+        const name = r.status === "fulfilled" ? r.value : undefined;
+        return { ...ws, name };
+      });
+
+      return text(enriched);
     } catch (error: any) {
       return text({ error: error.message });
     }
