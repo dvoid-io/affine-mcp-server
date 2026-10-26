@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mod = await import(
   pathToFileURL(path.resolve(__dirname, "..", "src", "tokenExchange.ts")).href
 );
-const { exchangeUserSession, invalidateUserSession, TokenExchangeError, _clearSessionCache } = mod;
+const { exchangeUserSession, invalidateUserSession, TokenExchangeError, isUnlinkedAccountError, _clearSessionCache } = mod;
 
 const PROXY_SECRET = "test-trusted-proxy-secret-do-not-leak";
 
@@ -153,6 +153,33 @@ await testCase("non-2xx throws TokenExchangeError with status and no secret leak
   assert.equal(err.status, 403);
   assert.ok(!err.message.includes(PROXY_SECRET), "secret not in error message");
   assert.ok(!err.message.includes(userA), "token not in error message");
+});
+
+// 5b. INVALID_AUTH_STATE (no ConnectedAccount yet) -> actionable message naming
+//     the sign-in URL, matched on the body's `name`, never on a substring.
+await testCase("INVALID_AUTH_STATE becomes the sign-in-once instruction", async () => {
+  responder = (_req, res) => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: 400, name: "INVALID_AUTH_STATE", message: "Invalid auth state." }));
+  };
+  const err = await exchangeUserSession(userA, { ...opts, signInUrl: "https://affine.example" }).catch((e) => e);
+  assert.ok(isUnlinkedAccountError(err), "classified as unlinked");
+  assert.equal(err.status, 400);
+  assert.equal(
+    err.message,
+    "Your AFFiNE account is not linked yet: sign in once at https://affine.example (Continue with OIDC), then retry.",
+  );
+});
+
+await testCase("INVALID_AUTH_STATE only in prose is not classified as unlinked", async () => {
+  responder = (_req, res) => {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ name: "BAD_REQUEST", message: "not INVALID_AUTH_STATE" }));
+  };
+  const err = await exchangeUserSession(userA, opts).catch((e) => e);
+  assert.ok(err instanceof TokenExchangeError);
+  assert.ok(!isUnlinkedAccountError(err), "a substring is not the name");
+  assert.match(err.message, /returned 400/);
 });
 
 // 6. Concurrent calls for same subject share a single in-flight exchange.

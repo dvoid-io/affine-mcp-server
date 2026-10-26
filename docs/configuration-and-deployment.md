@@ -58,6 +58,7 @@ Auth priority within the active configuration:
 | `AFFINE_MCP_PUBLIC_BASE_URL` | Required in OAuth mode | none | Public base URL for this MCP server |
 | `AFFINE_OAUTH_ISSUER_URL` | Required in OAuth mode | none | OAuth issuer discovery URL |
 | `AFFINE_OAUTH_SCOPES` | No | `mcp` | Scopes advertised for OAuth-protected access |
+| `AFFINE_PUBLIC_URL` | No | `AFFINE_BASE_URL` | AFFiNE's public web origin, named when a per-user token exchange finds no linked account (`INVALID_AUTH_STATE`): "sign in once at <url>". Set it when `AFFINE_BASE_URL` is a private address |
 
 ## Auth strategy matrix
 

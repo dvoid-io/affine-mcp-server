@@ -52,6 +52,9 @@ async function findFreePort() {
 
 // --- Fake AFFiNE backend (token-exchange + graphql) ---
 const graphqlAuthSeen = [];
+// Subjects AFFiNE has no ConnectedAccount for (never signed in on the web).
+const UNLINKED_SUB = "user-unlinked";
+const exchangeSubjects = [];
 const fakeAffine = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -59,6 +62,13 @@ const fakeAffine = http.createServer((req, res) => {
     if (req.url.startsWith("/api/auth/token-exchange")) {
       if (req.headers["x-affine-trusted-proxy-secret"] !== PROXY_SECRET) {
         res.writeHead(403).end("forbidden");
+        return;
+      }
+      const sub = JSON.parse(Buffer.from(JSON.parse(body).subject_token.split(".")[1], "base64url")).sub;
+      exchangeSubjects.push(sub);
+      if (sub === UNLINKED_SUB) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: 400, name: "INVALID_AUTH_STATE", message: "Invalid auth state." }));
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -107,6 +117,7 @@ try {
       AFFINE_API_TOKEN: SERVICE_TOKEN,
       AFFINE_TOKEN_EXCHANGE_URL: `${affineBase}/api/auth/token-exchange`,
       AFFINE_TRUSTED_PROXY_SECRET: PROXY_SECRET,
+      AFFINE_PUBLIC_URL: "https://affine.example",
       // Restrict to a tiny surface so the test is fast & deterministic.
       AFFINE_TOOL_PROFILE: "full",
       XDG_CONFIG_HOME: "/tmp/affine-test-" + Date.now(),
@@ -158,6 +169,26 @@ try {
     assert.equal(seen.authorization, `Bearer ${SERVICE_TOKEN}`);
     assert.equal(seen.cookie, null, "no per-user cookie on the fallback path");
   });
+
+  // D. Unlinked account -> the caller is told to sign in once, and the exchange
+  //    is attempted exactly once (INVALID_AUTH_STATE can never succeed on retry).
+  exchangeSubjects.length = 0;
+  const unlinked = makeJwt({ sub: UNLINKED_SUB, exp: Math.floor(Date.now() / 1000) + 3600 });
+  const unlinkedErr = await callCurrentUser({ "x-dvoid-access-token": unlinked }).then(
+    () => undefined,
+    (e) => e,
+  );
+  check("unlinked account surfaces the sign-in-once instruction", () => {
+    assert.ok(unlinkedErr, "the call fails");
+    assert.match(
+      String(unlinkedErr?.message),
+      /Your AFFiNE account is not linked yet: sign in once at https:\/\/affine\.example \(Continue with OIDC\), then retry\./,
+    );
+  });
+  check("unlinked account is not retried", () => {
+    assert.deepEqual(exchangeSubjects, [UNLINKED_SUB]);
+  });
+
   mcp.kill("SIGTERM");
   await delay(300);
 

@@ -20,14 +20,43 @@ const EXPIRY_SKEW_SECONDS = 30;
  */
 const DEFAULT_SESSION_TTL_MS = 5 * 60_000;
 
+/**
+ * AFFiNE's error name when no `ConnectedAccount(oidc, sub)` exists for the
+ * subject: the member has never signed in to AFFiNE on the web, and only that
+ * interactive OIDC sign-in creates the link. Retrying can never succeed.
+ */
+export const UNLINKED_ACCOUNT_ERROR = "INVALID_AUTH_STATE";
+
 /** Typed error so callers can distinguish exchange failures from GraphQL errors. */
 export class TokenExchangeError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** AFFiNE's error `name` when the body carried one (e.g. INVALID_AUTH_STATE). */
+    readonly code?: string,
   ) {
     super(message);
     this.name = "TokenExchangeError";
+  }
+}
+
+/** True when the failure is the not-yet-linked account: never retry, tell the member. */
+export function isUnlinkedAccountError(err: unknown): err is TokenExchangeError {
+  return err instanceof TokenExchangeError && err.code === UNLINKED_ACCOUNT_ERROR;
+}
+
+/** The member-facing instruction for an unlinked account. */
+export function unlinkedAccountMessage(signInUrl: string): string {
+  return `Your AFFiNE account is not linked yet: sign in once at ${signInUrl} (Continue with OIDC), then retry.`;
+}
+
+/** AFFiNE's error `name` from a JSON error body, if it parses and carries one. */
+function errorName(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.name === "string" ? parsed.name : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -36,6 +65,11 @@ export type TokenExchangeOptions = {
   url: string;
   /** `x-affine-trusted-proxy-secret` value. Never logged. */
   proxySecret: string;
+  /**
+   * AFFiNE's public web origin, named in the unlinked-account message as the
+   * place to sign in once. Defaults to the exchange URL's origin.
+   */
+  signInUrl?: string;
 };
 
 export type UserSession = {
@@ -121,15 +155,27 @@ async function performExchange(
     // request's subject_token or proxy secret — so it is safe to surface, and
     // it carries the reason needed to fix the failure (e.g. which check the
     // verifier rejected). Truncate + collapse whitespace defensively.
-    let body = "";
+    let raw = "";
     try {
-      body = (await res.text()).slice(0, 400).replace(/\s+/g, " ").trim();
+      raw = await res.text();
     } catch {
       /* body unreadable — fall back to status alone */
+    }
+    const body = raw.slice(0, 400).replace(/\s+/g, " ").trim();
+    const name = errorName(raw);
+    if (name === UNLINKED_ACCOUNT_ERROR) {
+      // The raw cause stays in the server log; the caller gets the fix.
+      console.error(`[affine-mcp] AFFiNE token-exchange returned ${res.status}: ${body}`);
+      throw new TokenExchangeError(
+        unlinkedAccountMessage(opts.signInUrl || new URL(opts.url).origin),
+        res.status,
+        name,
+      );
     }
     throw new TokenExchangeError(
       `AFFiNE token-exchange returned ${res.status}${body ? `: ${body}` : ""}`,
       res.status,
+      name,
     );
   }
 

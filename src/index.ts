@@ -20,7 +20,7 @@ import { startHttpMcpServer } from "./sse.js";
 import { existsSync } from "fs";
 import { CONFIG_FILE } from "./config.js";
 import { createToolFilter, toolFilterRequiresRegisterTool } from "./toolSurface.js";
-import { exchangeUserSession, invalidateUserSession, TokenExchangeError } from "./tokenExchange.js";
+import { exchangeUserSession, invalidateUserSession, isUnlinkedAccountError, TokenExchangeError } from "./tokenExchange.js";
 import { getBrokerIdentity } from "./broker.js";
 import type { Request } from "express";
 
@@ -232,6 +232,7 @@ async function buildUserGraphQLClient(userAccessToken: string): Promise<GraphQLC
   const { affineSession } = await exchangeUserSession(userAccessToken, {
     url: config.tokenExchange.url!,
     proxySecret: config.tokenExchange.proxySecret!,
+    signInUrl: config.affinePublicUrl,
   });
   return new GraphQLClient({
     endpoint: `${config.baseUrl}${config.graphqlPath}`,
@@ -268,6 +269,8 @@ async function buildUserGraphQLClientWithRetry(
       return await buildUserGraphQLClient(userAccessToken);
     } catch (err) {
       lastErr = err;
+      // An unlinked account is not transient: only a web sign-in fixes it.
+      if (isUnlinkedAccountError(err)) break;
       const detail = err instanceof TokenExchangeError ? err.message : "unexpected error";
       if (i < attempts - 1) {
         console.error(
@@ -309,6 +312,8 @@ async function buildServer(req?: Request): Promise<McpServer> {
         gql = await buildUserGraphQLClientWithRetry(identity.token);
         console.error("[affine-mcp] Using per-user AFFiNE session (broker token)");
       } catch (err) {
+        // The member's own next step, said plainly (the raw cause is already logged).
+        if (isUnlinkedAccountError(err)) throw err;
         const detail = err instanceof TokenExchangeError ? err.message : String(err);
         const message =
           `Per-user AFFiNE identity could not be established (${detail}). ` +
@@ -334,6 +339,7 @@ async function buildServer(req?: Request): Promise<McpServer> {
         gql = await buildUserGraphQLClientWithRetry(userToken);
         console.error("[affine-mcp] Using per-user AFFiNE session (token-exchange)");
       } catch (err) {
+        if (isUnlinkedAccountError(err)) throw err;
         const detail = err instanceof TokenExchangeError ? err.message : String(err);
         const message =
           `Per-user AFFiNE identity could not be established (${detail}). ` +

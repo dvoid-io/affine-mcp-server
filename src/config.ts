@@ -18,6 +18,12 @@ export type ServerConfig = {
   defaultWorkspaceId?: string;
   authMode: AuthMode;
   publicBaseUrl?: string;
+  /**
+   * AFFiNE's public web origin (AFFINE_PUBLIC_URL), where a member signs in.
+   * Differs from `baseUrl` when the server reaches AFFiNE over a private network.
+   * Defaults to `baseUrl`.
+   */
+  affinePublicUrl: string;
   oauthIssuerUrl?: string;
   oauthScopes: string[];
   oauthClockSkewSeconds: number;
@@ -199,6 +205,8 @@ export function loadConfig(): ServerConfig {
   }
   const graphqlPath = env("AFFINE_GRAPHQL_PATH", file, "/graphql")!;
   const defaultWorkspaceId = env("AFFINE_WORKSPACE_ID", file);
+  const affinePublicUrlRaw = env("AFFINE_PUBLIC_URL", file);
+  const affinePublicUrl = affinePublicUrlRaw ? validateBaseUrl(affinePublicUrlRaw) : baseUrl;
   const publicBaseUrlRaw = env("AFFINE_MCP_PUBLIC_BASE_URL", file);
   const oauthIssuerUrlRaw = env("AFFINE_OAUTH_ISSUER_URL", file);
   const publicBaseUrl = publicBaseUrlRaw ? validateBaseUrl(publicBaseUrlRaw) : undefined;
@@ -249,6 +257,7 @@ export function loadConfig(): ServerConfig {
     defaultWorkspaceId,
     authMode,
     publicBaseUrl,
+    affinePublicUrl,
     oauthIssuerUrl,
     oauthScopes,
     oauthClockSkewSeconds,
